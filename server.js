@@ -106,6 +106,28 @@ function norm(name) {
     .trim();
 }
 
+// Resolve a user-typed station name to the exact norm key used in stationIndex.
+// Handles cases like "București Nord" matching "Bucuresti Nord Gr.A"
+function resolveStation(userInput) {
+  const n = norm(userInput);
+  // 1. Exact match
+  if (stationIndex.has(n)) return n;
+  // 2. Find any indexed station whose norm starts with the user input
+  //    e.g. "bucuresti nord" matches "bucuresti nord gr a"
+  for (const key of stationIndex.keys()) {
+    if (key.startsWith(n + ' ') || key === n) return key;
+  }
+  // 3. Find any indexed station that contains the user input
+  for (const key of stationIndex.keys()) {
+    if (key.includes(n)) return key;
+  }
+  // 4. User input contains the indexed key (e.g. user typed full name, XML is shorter)
+  for (const key of stationIndex.keys()) {
+    if (n.startsWith(key + ' ') || n === key) return key;
+  }
+  return n; // fallback — return as-is
+}
+
 function guessType(cat) {
   const c = (cat || '').toUpperCase();
   if (c === 'EC')  return 'EuroCity';
@@ -424,8 +446,8 @@ function findDirectJourneys(fromNorm, toNorm) {
 }
 
 function searchJourneys(fromName, toName) {
-  const fN = norm(fromName);
-  const tN = norm(toName);
+  const fN = resolveStation(fromName);
+  const tN = resolveStation(toName);
 
   const journeys = [];
 
@@ -656,7 +678,7 @@ app.get('/api/itineraries', (req, res) => {
   if (!from || !to) return res.status(400).json({ error: 'from and to are required' });
   if (!dataReady)   return res.status(503).json({ error: 'Loading, try again in 30s', status: loadStatus });
 
-  const key    = `itin:${norm(from)}:${norm(to)}:${date}`;
+  const key    = `itin:${resolveStation(from)}:${resolveStation(to)}:${date}`;
   const cached = cacheGet(key);
   if (cached) return res.json({ source: 'cache', from, to, date, journeys: cached, count: cached.length });
 
@@ -713,13 +735,20 @@ app.get('/api/board/:stationName', (req, res) => {
   if (!dataReady) return res.status(503).json({ error: 'Loading, try again in 30s' });
 
   const stName = req.params.stationName.trim();
-  const n      = norm(stName);
+  const n      = resolveStation(stName);
   const nums   = stationIndex.get(n);
 
   if (!nums || nums.size === 0) {
+    // Try partial match — find closest station name
+    const q2 = norm(stName);
+    const suggestions = [];
+    for (const [key] of stationIndex) {
+      if (key.includes(q2) || q2.includes(key)) suggestions.push(key);
+    }
     return res.status(404).json({
       error: `Station "${stName}" not found`,
-      hint:  'Use /api/stations?q=... to find the correct name',
+      suggestions: suggestions.slice(0, 5),
+      hint: 'Use /api/stations?q=... to find the correct name',
     });
   }
 
