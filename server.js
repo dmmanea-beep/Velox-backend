@@ -756,7 +756,7 @@ function searchJourneys(fromName, toName, dateStr) {
       return true;
     })
     .sort((a, b) => a.depM - b.depM)
-    .slice(0, 100);
+    .slice(0, 200); // full day of trains
 }
 
 // ─── REAL-TIME DELAY (IRIS) ────────────────────────────────────────────────
