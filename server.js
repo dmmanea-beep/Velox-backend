@@ -703,6 +703,45 @@ app.get('/health', (req, res) => res.json({
   time:     new Date().toISOString(),
 }));
 
+
+// GET /api/debug/:trainNumber — show raw schedule data + InfoFer test
+app.get('/api/debug/:trainNumber', async (req, res) => {
+  const num = req.params.trainNumber.trim();
+  const date = (req.query.date || todayStr()).trim();
+  const train = trains.get(num);
+  if (!train) return res.json({ error: 'Train not found', num });
+
+  // Test InfoFer connectivity
+  let infoferResult = null;
+  try {
+    const url = `https://mersultrenurilor.infofer.ro/ro-RO/Tren/Info-tren?tren=${encodeURIComponent(num)}&data=${encodeURIComponent(date)}`;
+    const r = await get(url, 8000);
+    infoferResult = {
+      status: r.status,
+      length: (r.body||'').length,
+      first300: (r.body||'').slice(0,300),
+      hasNuCircula: /nu circulă|nu circula/i.test(r.body||''),
+      hasTrainInfo: (r.body||'').length > 800,
+    };
+  } catch(e) {
+    infoferResult = { error: e.message };
+  }
+
+  return res.json({
+    num,
+    date,
+    category: train.category,
+    operator: train.operator,
+    schedule: train.schedule,
+    scheduleLength: train.schedule ? train.schedule.length : 0,
+    trainRunsOnDate: trainRunsOnDate(train, date),
+    stationCount: train.stations.length,
+    firstStation: train.stations[0],
+    lastStation: train.stations[train.stations.length-1],
+    infofer: infoferResult,
+  });
+});
+
 // GET /api/stations?q=Brasov
 app.get('/api/stations', (req, res) => {
   const q = norm(req.query.q || '');
@@ -795,24 +834,40 @@ async function checkTrainOnInfoFer(trainNum, dateStr) {
   const cached = cacheGet(cacheKey);
   if (cached !== null) return cached;
 
-  const url = `https://mersultrenurilor.infofer.ro/ro-RO/Tren/Info-tren?tren=${encodeURIComponent(trainNum)}&data=${encodeURIComponent(dateStr)}`;
+  // Strategy 1: Try mersultrenurilor.infofer.ro/ro-RO/Tren/Info-tren
+  // This returns different HTML depending on whether train runs on that date
+  const url1 = `https://mersultrenurilor.infofer.ro/ro-RO/Tren/Info-tren?tren=${encodeURIComponent(trainNum)}&data=${encodeURIComponent(dateStr)}`;
   try {
-    const r = await get(url, 7000);
-    const html = r.body || '';
-    // InfoFer shows these phrases when a train doesn't run on a given date
-    const notRunning =
-      /nu circulă/i.test(html) ||
-      /nu circula/i.test(html) ||
-      /nu există informaţii/i.test(html) ||
-      /nu exista informatii/i.test(html) ||
-      /trenul nu a fost găsit/i.test(html) ||
-      /not found/i.test(html) ||
-      html.length < 800; // very short = error page
-    const running = !notRunning;
-    cacheSet(cacheKey, running, 3600); // cache 1 hour per train+date
-    return running;
+    const r1 = await get(url1, 8000);
+    const html1 = r1.body || '';
+    if (html1.length > 100) {
+      // Train NOT running indicators (Romanian InfoFer phrases)
+      const notRunning =
+        /nu circul[aă]/i.test(html1) ||
+        /nu exist[aă] informa/i.test(html1) ||
+        /trenul nu a fost g[aă]sit/i.test(html1) ||
+        /nu exist[aă] date/i.test(html1) ||
+        /eroare/i.test(html1) ||
+        // If response is extremely short with no timetable table, it's an error page
+        (html1.length < 1500 && !/<table/i.test(html1));
+      const running = !notRunning;
+      cacheSet(cacheKey, running, 3600);
+      return running;
+    }
+  } catch (e) { /* fall through to IRIS */ }
+
+  // Strategy 2: Try IRIS - if it returns no station data, train doesn't run today
+  try {
+    const r2 = await get(IRIS_URL(trainNum), 6000);
+    const html2 = r2.body || '';
+    // IRIS returns a proper page with station table when train runs
+    // If no table rows with times, the train is not running
+    const hasStationData = /<tr[^>]*>[\s\S]{10,}<\/tr>/i.test(html2) &&
+                           /\d{2}:\d{2}/.test(html2);
+    cacheSet(cacheKey, hasStationData, 3600);
+    return hasStationData;
   } catch (e) {
-    // Network error — fail open (show train rather than hide valid ones)
+    // Both checks failed — fail open
     cacheSet(cacheKey, true, 300);
     return true;
   }
@@ -829,23 +884,27 @@ async function validateTrains(trainNumbers, dateStr) {
     const train = trains.get(num);
     if (!train) { results[num] = false; continue; }
 
-    // Try XML schedule data first (zero latency)
+    // XML schedule check first (instant, no HTTP)
     if (train.schedule && train.schedule.length > 0) {
       const xmlSays = trainRunsOnDate(train, dateStr);
-      if (!xmlSays) { results[num] = false; continue; }
-      // XML says it runs — still verify against InfoFer (XML schedule can be wrong)
-      needsInfoFer.push(num);
-    } else {
-      // No schedule in XML — must check InfoFer
-      needsInfoFer.push(num);
+      if (!xmlSays) {
+        console.log(`[validate] ${num} BLOCKED by XML schedule for ${dateStr}`);
+        results[num] = false;
+        continue;
+      }
     }
+    // Always verify against InfoFer regardless of XML schedule
+    // (XML schedules are often incomplete or wrong)
+    needsInfoFer.push(num);
   }
 
-  // Check InfoFer in parallel batches of 6
-  for (let i = 0; i < needsInfoFer.length; i += 6) {
-    const batch = needsInfoFer.slice(i, i + 6);
+  // Check InfoFer in parallel batches of 5
+  for (let i = 0; i < needsInfoFer.length; i += 5) {
+    const batch = needsInfoFer.slice(i, i + 5);
     await Promise.all(batch.map(async num => {
-      results[num] = await checkTrainOnInfoFer(num, dateStr);
+      const ok = await checkTrainOnInfoFer(num, dateStr);
+      if (!ok) console.log(`[validate] ${num} BLOCKED by InfoFer for ${dateStr}`);
+      results[num] = ok;
     }));
   }
 
