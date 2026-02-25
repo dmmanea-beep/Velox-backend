@@ -605,7 +605,7 @@ function searchJourneys(fromName, toName, dateStr) {
       return true;
     })
     .sort((a, b) => a.depM - b.depM)
-    .slice(0, 100);
+    .slice(0, 25);
 }
 
 // ─── REAL-TIME DELAY (IRIS) ────────────────────────────────────────────────
@@ -642,9 +642,16 @@ async function getLiveDelay(trainNumber) {
       }
     }
 
+    // Extract platform/line number - IRIS shows "Linia X" or "Peronul X"  
+    const platformM = html.match(/[Ll]inia\s*(\d+)/i)
+                    || html.match(/[Pp]eron(?:ul)?\s*(\d+)/i)
+                    || html.match(/[Tt]rack\s*(\d+)/i);
+    const platform = platformM ? platformM[1] : null;
+
     const result = {
       trainNumber,
       delay,
+      platform,
       onTime:        delay === 0,
       stationDelays,
       liveAvailable: true,
@@ -738,7 +745,7 @@ app.get('/api/stations', (req, res) => {
 });
 
 // GET /api/itineraries?from=Brașov&to=Constanța&date=24.02.2026
-app.get('/api/itineraries', (req, res) => {
+app.get('/api/itineraries', async (req, res) => {
   const from = (req.query.from || '').trim();
   const to   = (req.query.to   || '').trim();
   const date = (req.query.date || '').trim() || todayStr();
@@ -750,77 +757,108 @@ app.get('/api/itineraries', (req, res) => {
   const cached = cacheGet(key);
   if (cached) return res.json({ source: 'cache', from, to, date, journeys: cached, count: cached.length });
 
-  const journeys = searchJourneys(from, to, date);
-  cacheSet(key, journeys, 300); // cache 5 minutes
+  const rawJourneys = searchJourneys(from, to, date);
 
+  // ── Validate every train number against InfoFer for the requested date ──
+  // This eliminates ghost trains that exist in the XML but don't run on this date.
+  const allTrainNums = [...new Set(
+    rawJourneys.flatMap(j => j.legs.map(l => l.number).filter(Boolean))
+  )];
+
+  let validNums = new Set(allTrainNums); // default: all valid
+  if (allTrainNums.length > 0) {
+    try {
+      const validation = await validateTrains(allTrainNums, date);
+      validNums = new Set(Object.entries(validation)
+        .filter(([, ok]) => ok)
+        .map(([num]) => num));
+    } catch (e) {
+      console.error('[itineraries] validation error:', e.message);
+      // Fail open — return all rather than nothing
+    }
+  }
+
+  // Filter out journeys where any leg's train doesn't run on this date
+  const journeys = rawJourneys.filter(j =>
+    j.legs.every(l => !l.number || validNums.has(l.number))
+  );
+
+  cacheSet(key, journeys, 300); // cache 5 minutes
   return res.json({ source: 'live', from, to, date, journeys, count: journeys.length });
 });
 
-// GET /api/validate-trains?numbers=532,1234,456&date=25.02.2026
-// Validates a batch of train numbers against InfoFer for the given date.
-// Returns { results: { "532": true, "1234": false, ... } }
-// Uses mersultrenurilor.infofer.ro which shows "nu circulă" for non-running trains.
+// ─── INFOFER TRAIN VALIDATION ─────────────────────────────────────────────
+// Check a single train number against InfoFer mers tren for a specific date.
+// Returns true if running, false if not found / not running on that date.
+async function checkTrainOnInfoFer(trainNum, dateStr) {
+  const cacheKey = `infofer:${trainNum}:${dateStr}`;
+  const cached = cacheGet(cacheKey);
+  if (cached !== null) return cached;
+
+  const url = `https://mersultrenurilor.infofer.ro/ro-RO/Tren/Info-tren?tren=${encodeURIComponent(trainNum)}&data=${encodeURIComponent(dateStr)}`;
+  try {
+    const r = await get(url, 7000);
+    const html = r.body || '';
+    // InfoFer shows these phrases when a train doesn't run on a given date
+    const notRunning =
+      /nu circulă/i.test(html) ||
+      /nu circula/i.test(html) ||
+      /nu există informaţii/i.test(html) ||
+      /nu exista informatii/i.test(html) ||
+      /trenul nu a fost găsit/i.test(html) ||
+      /not found/i.test(html) ||
+      html.length < 800; // very short = error page
+    const running = !notRunning;
+    cacheSet(cacheKey, running, 3600); // cache 1 hour per train+date
+    return running;
+  } catch (e) {
+    // Network error — fail open (show train rather than hide valid ones)
+    cacheSet(cacheKey, true, 300);
+    return true;
+  }
+}
+
+// Validate a list of train numbers for a date.
+// Returns an object { trainNum: true/false }
+// Uses XML schedule first, falls back to InfoFer for trains with no schedule data.
+async function validateTrains(trainNumbers, dateStr) {
+  const results = {};
+  const needsInfoFer = [];
+
+  for (const num of trainNumbers) {
+    const train = trains.get(num);
+    if (!train) { results[num] = false; continue; }
+
+    // Try XML schedule data first (zero latency)
+    if (train.schedule && train.schedule.length > 0) {
+      const xmlSays = trainRunsOnDate(train, dateStr);
+      if (!xmlSays) { results[num] = false; continue; }
+      // XML says it runs — still verify against InfoFer (XML schedule can be wrong)
+      needsInfoFer.push(num);
+    } else {
+      // No schedule in XML — must check InfoFer
+      needsInfoFer.push(num);
+    }
+  }
+
+  // Check InfoFer in parallel batches of 6
+  for (let i = 0; i < needsInfoFer.length; i += 6) {
+    const batch = needsInfoFer.slice(i, i + 6);
+    await Promise.all(batch.map(async num => {
+      results[num] = await checkTrainOnInfoFer(num, dateStr);
+    }));
+  }
+
+  return results;
+}
+
+// GET /api/validate-trains?numbers=532,1234&date=25.02.2026
 app.get('/api/validate-trains', async (req, res) => {
   const numbersRaw = (req.query.numbers || '').trim();
   const date = (req.query.date || todayStr()).trim();
   if (!numbersRaw) return res.json({ results: {} });
-
-  const numbers = numbersRaw.split(',').map(n => n.trim()).filter(Boolean).slice(0, 15);
-  const results = {};
-
-  // First check schedule data we already have from XML
-  const needsRemoteCheck = [];
-  for (const num of numbers) {
-    const train = trains.get(num);
-    if (!train) {
-      results[num] = false; // not in our DB at all
-      continue;
-    }
-    if (train.schedule && train.schedule.length > 0) {
-      // We have schedule data — use it
-      results[num] = trainRunsOnDate(train, date);
-    } else {
-      // No schedule data in XML — need to check InfoFer
-      needsRemoteCheck.push(num);
-      results[num] = true; // optimistic default
-    }
-  }
-
-  // For trains without schedule data, check InfoFer in parallel (max 5 at once)
-  if (needsRemoteCheck.length > 0) {
-    const INFOFER_URL = (num, d) =>
-      `https://mersultrenurilor.infofer.ro/ro-RO/Tren/Info-tren?tren=${encodeURIComponent(num)}&data=${encodeURIComponent(d)}`;
-
-    const checkBatch = async (nums) => {
-      await Promise.all(nums.map(async (num) => {
-        try {
-          const r = await get(INFOFER_URL(num, date), 6000);
-          const html = r.body || '';
-          // Not running indicators in InfoFer HTML
-          const notRunning =
-            /nu circulă/i.test(html) ||
-            /nu circula/i.test(html) ||
-            /nu există/i.test(html) ||
-            /nu exista/i.test(html) ||
-            /Eroare/i.test(html) ||
-            /not found/i.test(html) ||
-            html.length < 500; // very short response = error page
-          results[num] = !notRunning;
-        } catch (e) {
-          results[num] = true; // if check fails, assume running (don't hide trains)
-        }
-      }));
-    };
-
-    // Process in batches of 5
-    for (let i = 0; i < needsRemoteCheck.length; i += 5) {
-      await checkBatch(needsRemoteCheck.slice(i, i + 5));
-    }
-  }
-
-  const cacheKey = `validate:${date}:${numbers.sort().join(',')}`;
-  cacheSet(cacheKey, results, 3600); // cache 1 hour
-
+  const numbers = numbersRaw.split(',').map(n => n.trim()).filter(Boolean).slice(0, 20);
+  const results = await validateTrains(numbers, date);
   return res.json({ date, results, checked: numbers.length });
 });
 
@@ -867,7 +905,7 @@ app.get('/api/train/:number/live', async (req, res) => {
 });
 
 // GET /api/board/:stationName  — all trains calling at a station today
-app.get('/api/board/:stationName', (req, res) => {
+app.get('/api/board/:stationName', async (req, res) => {
   if (!dataReady) return res.status(503).json({ error: 'Loading, try again in 30s' });
 
   const stName = req.params.stationName.trim();
@@ -875,7 +913,6 @@ app.get('/api/board/:stationName', (req, res) => {
   const nums   = stationIndex.get(n);
 
   if (!nums || nums.size === 0) {
-    // Try partial match — find closest station name
     const q2 = norm(stName);
     const suggestions = [];
     for (const [key] of stationIndex) {
@@ -888,7 +925,10 @@ app.get('/api/board/:stationName', (req, res) => {
     });
   }
 
-  const departures = [];
+  const date = todayStr(); // board always shows today
+
+  // Build raw departures list
+  const rawDepartures = [];
   for (const tNum of nums) {
     const train = trains.get(tNum);
     if (!train) continue;
@@ -896,21 +936,53 @@ app.get('/api/board/:stationName', (req, res) => {
     if (!st) continue;
     const dep = st.dep || st.arr;
     if (!dep) continue;
-
-    departures.push({
+    rawDepartures.push({
       time:     dep,
       train:    `${train.category} ${train.number}`,
+      trainNumber: train.number,
       number:   train.number,
       type:     train.type,
       operator: train.operator,
+      from:     train.stations[0].name,
       to:       train.stations[train.stations.length - 1].name,
       arr:      train.stations[train.stations.length - 1].arr,
-      delay:    0, // enriched by /live endpoint
+      delay:    0,
     });
   }
 
+  // ── Validate against InfoFer for today ──────────────────────────────────
+  const allNums = [...new Set(rawDepartures.map(d => d.number).filter(Boolean))];
+  let validNums = new Set(allNums);
+  if (allNums.length > 0) {
+    try {
+      const validation = await validateTrains(allNums, date);
+      validNums = new Set(Object.entries(validation)
+        .filter(([, ok]) => ok)
+        .map(([num]) => num));
+    } catch (e) {
+      console.error('[board] validation error:', e.message);
+      // Fail open
+    }
+  }
+
+  const departures = rawDepartures.filter(d => !d.number || validNums.has(d.number));
   const gps = stationGPS.get(n);
   departures.sort((a, b) => timeToMins(a.time) - timeToMins(b.time));
+
+  // ── Enrich with live delay + platform from IRIS ────────────────────────
+  // Only fetch live for upcoming trains (first 20) to keep response fast
+  const nowM = timeToMins(todayStr()) || 0;
+  const toEnrich = departures.slice(0, 20);
+  await Promise.all(toEnrich.map(async dep => {
+    if (!dep.number) return;
+    try {
+      const live = await getLiveDelay(dep.number);
+      if (live && live.liveAvailable) {
+        dep.delay    = live.delay    || 0;
+        dep.platform = live.platform || null;
+      }
+    } catch (e) { /* keep delay=0 */ }
+  }));
 
   return res.json({
     station:    stName,
