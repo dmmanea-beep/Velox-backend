@@ -81,6 +81,107 @@ function get(url, timeout = 60000, hops = 0) {
   });
 }
 
+// ─── HTTP POST HELPER ──────────────────────────────────────────────────────
+function post(url, formData, timeout = 12000) {
+  return new Promise((res, rej) => {
+    const body = Object.entries(formData)
+      .map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v))
+      .join('&');
+    const u = new URL(url);
+    const lib = url.startsWith('https') ? https : http;
+    const req = lib.request({
+      hostname: u.hostname,
+      port: u.port || (url.startsWith('https') ? 443 : 80),
+      path: u.pathname + (u.search || ''),
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(body),
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,application/xhtml+xml',
+        'Accept-Language': 'ro-RO,ro;q=0.9',
+        'Referer': url,
+      },
+    }, (r) => {
+      const chunks = [];
+      r.on('data', c => chunks.push(c));
+      r.on('end', () => res({ status: r.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+    });
+    req.on('error', rej);
+    req.setTimeout(timeout, () => { req.destroy(); rej(new Error('POST timeout')); });
+    req.write(body);
+    req.end();
+  });
+}
+
+// Scrape IRIS SosPlcRO.aspx for today's REAL departures at a station.
+// This is the authoritative source - only trains actually running today appear here.
+async function getIRISStationBoard(stationName) {
+  const cacheKey = 'iris_board:' + norm(stationName) + ':' + todayStr();
+  const cached = cacheGet(cacheKey);
+  if (cached !== null) return cached;
+
+  const IRIS_STA = 'http://appiris.infofer.ro/SosPlcRO.aspx';
+  try {
+    // GET the form page first to extract ASP.NET hidden fields
+    const page1 = await get(IRIS_STA, 10000);
+    const html1 = page1.body || '';
+    const vsM  = html1.match(/name="__VIEWSTATE"\s+[^>]*value="([^"]+)"/);
+    const evM  = html1.match(/name="__EVENTVALIDATION"\s+[^>]*value="([^"]+)"/);
+    const vsgM = html1.match(/name="__VIEWSTATEGENERATOR"\s+[^>]*value="([^"]+)"/);
+
+    if (!vsM) {
+      console.log('[IRIS-board] Could not extract VIEWSTATE');
+      return null;
+    }
+
+    // POST with station + today's date
+    const formData = {
+      '__VIEWSTATE':           vsM[1],
+      '__EVENTVALIDATION':     evM  ? evM[1]  : '',
+      '__VIEWSTATEGENERATOR':  vsgM ? vsgM[1] : '',
+      '__EVENTTARGET':         '',
+      '__EVENTARGUMENT':       '',
+      'ctl00$ContentPlaceHolder1$txtStatie': stationName,
+      'ctl00$ContentPlaceHolder1$txtData':   todayStr(),
+      'ctl00$ContentPlaceHolder1$btnCauta':  'Cauta',
+    };
+
+    const page2 = await post(IRIS_STA, formData, 12000);
+    const html2 = page2.body || '';
+    if (html2.length < 300) { console.log('[IRIS-board] Short response'); return null; }
+
+    // Parse the departures table rows
+    const departures = [];
+    const rows = html2.match(/<tr[\s\S]*?<\/tr>/gi) || [];
+    for (const row of rows) {
+      const cells = (row.match(/<td[^>]*>([\s\S]*?)<\/td>/gi) || [])
+        .map(c => stripTags(c).trim().replace(/\s+/g, ' '));
+      if (cells.length < 3) continue;
+      const timeM = (cells[0] || '').match(/(\d{2}:\d{2})/);
+      if (!timeM) continue;
+      const trainRaw = cells[1] || '';
+      const numM = trainRaw.match(/(\d{3,5})/);
+      const catM = trainRaw.match(/^([A-Za-z]{1,5})/);
+      departures.push({
+        time:     timeM[1],
+        number:   numM ? numM[1] : '',
+        category: catM ? catM[1].toUpperCase() : '',
+        to:       cells[2] || '',
+        delay:    parseInt((cells[4]||'').replace(/\D/g,''))||0,
+        platform: (cells[5]||'').replace(/\D/g,'')||null,
+      });
+    }
+
+    console.log('[IRIS-board]', stationName, ':', departures.length, 'trains');
+    if (departures.length > 0) cacheSet(cacheKey, departures, 300);
+    return departures.length > 0 ? departures : null;
+  } catch (e) {
+    console.error('[IRIS-board] Error:', e.message);
+    return null;
+  }
+}
+
 // ─── HELPERS ───────────────────────────────────────────────────────────────
 
 // Convert seconds-since-midnight to HH:MM
@@ -340,24 +441,52 @@ function parseCFRXmlV2(xml, defaultOperator) {
     const number   = numM[1].trim();
     const category = catM ? catM[1].trim() : '';
 
-    // ── Extract schedule (days of operation) from <Trasa> elements ──────
-    // <Trasa ZileSaptamana="12345" DataInceput="01.12.2025" DataSfarsit="14.06.2026">
-    // ZileSaptamana: 1=Mon,2=Tue,3=Wed,4=Thu,5=Fri,6=Sat,7=Sun
+    // ── Extract schedule (days of operation) ──────────────────────────────
+    // Try multiple XML formats used by different Romanian operators:
+    // Format A: <Trasa ZileSaptamana="12345" DataInceput="01.12.2025" DataSfarsit="14.06.2026">
+    // Format B: <Circulatie ZileSaptamana="12345" ...>
+    // Format C: <Calendar ZileSaptamana="12345" ...>
+    // ZileSaptamana digits: 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat, 7=Sun
     const schedule = [];
-    const trasaRe = /<Trasa\b([^>]*)>/g;
-    let trasaM;
-    while ((trasaM = trasaRe.exec(body)) !== null) {
-      const ta = trasaM[1];
-      const daysM  = ta.match(/ZileSaptamana="([^"]+)"/);
-      const startM = ta.match(/DataInceput="([^"]+)"/);
-      const endM   = ta.match(/DataSfarsit="([^"]+)"/)
-                  || ta.match(/DataFinal="([^"]+)"/)
-                  || ta.match(/DataSfir="([^"]+)"/);
-      schedule.push({
-        days:      daysM  ? daysM[1].trim()  : '',
-        dateStart: startM ? startM[1].trim() : '',
-        dateEnd:   endM   ? endM[1].trim()   : '',
-      });
+    // Try all known element names that carry schedule data
+    const schedTagRe = /<(?:Trasa|Circulatie|Calendar|Serviciu|Grafic|PerioadaCirculatie)\b([^>]*)>/gi;
+    let schedM;
+    while ((schedM = schedTagRe.exec(body)) !== null) {
+      const ta = schedM[1];
+      const daysM  = ta.match(/ZileSaptamana="([^"]+)"/i)
+                  || ta.match(/ZileSapt="([^"]+)"/i)
+                  || ta.match(/DaysOfWeek="([^"]+)"/i)
+                  || ta.match(/Zile="([^"]+)"/i);
+      const startM = ta.match(/DataInceput="([^"]+)"/i)
+                  || ta.match(/DataStart="([^"]+)"/i)
+                  || ta.match(/StartDate="([^"]+)"/i)
+                  || ta.match(/De="([^"]+)"/i);
+      const endM   = ta.match(/DataSfarsit="([^"]+)"/i)
+                  || ta.match(/DataFinal="([^"]+)"/i)
+                  || ta.match(/DataSfir="([^"]+)"/i)
+                  || ta.match(/EndDate="([^"]+)"/i)
+                  || ta.match(/Pana="([^"]+)"/i);
+      if (daysM || startM || endM) {
+        schedule.push({
+          days:      daysM  ? daysM[1].trim()  : '',
+          dateStart: startM ? startM[1].trim() : '',
+          dateEnd:   endM   ? endM[1].trim()   : '',
+        });
+      }
+    }
+    
+    // Also try to find ZileSaptamana as a direct child element: <ZileSaptamana>12345</ZileSaptamana>
+    if (schedule.length === 0) {
+      const zileEl = body.match(/<ZileSaptamana[^>]*>([^<]+)<\/ZileSaptamana>/i);
+      const startEl = body.match(/<(?:DataInceput|DataStart)[^>]*>([^<]+)<\/(?:DataInceput|DataStart)>/i);
+      const endEl   = body.match(/<(?:DataSfarsit|DataFinal)[^>]*>([^<]+)<\/(?:DataSfarsit|DataFinal)>/i);
+      if (zileEl) {
+        schedule.push({
+          days:      zileEl[1].trim(),
+          dateStart: startEl ? startEl[1].trim() : '',
+          dateEnd:   endEl   ? endEl[1].trim()   : '',
+        });
+      }
     }
 
     // Collect all ElementTrasa in order
@@ -437,6 +566,28 @@ async function loadData() {
 
       console.log(`[boot] ${src.operator}: ${(r.body.length / 1024).toFixed(0)} KB`);
       const parsed = parseCFRXmlV2(r.body, src.operator);
+      
+      // Log XML structure sample for debugging ghost trains
+      if (parsed.length > 0) {
+        const sample = parsed[0];
+        console.log(`[XML-STRUCT] ${src.operator}: first train ${sample.number}, schedule entries: ${sample.schedule ? sample.schedule.length : 'none'}`);
+        if (sample.schedule && sample.schedule.length > 0) {
+          console.log(`[XML-STRUCT] Sample schedule:`, JSON.stringify(sample.schedule[0]));
+        } else {
+          // Try to find ZileSaptamana in raw XML for diagnosis
+          const rawSample = r.body.slice(0, 3000);
+          const hasZile = rawSample.includes('ZileSaptamana');
+          const hasTrasa = rawSample.includes('Trasa');
+          const hasCirculatie = rawSample.includes('Circulatie');
+          const hasCalendar = rawSample.includes('Calendar');
+          console.log(`[XML-STRUCT] No schedule found. Raw XML has: ZileSaptamana=${hasZile}, Trasa=${hasTrasa}, Circulatie=${hasCirculatie}, Calendar=${hasCalendar}`);
+          // Show first 1000 chars of XML for structure inspection
+          console.log('[XML-STRUCT] First 800 chars:', rawSample.slice(0, 800).replace(/\s+/g, ' '));
+        }
+        // Count trains with/without schedule
+        const withSched = parsed.filter(t => t.schedule && t.schedule.length > 0).length;
+        console.log(`[XML-STRUCT] ${src.operator}: ${withSched}/${parsed.length} trains have schedule data`);
+      }
       console.log(`[boot] ${src.operator}: ${parsed.length} trains parsed`);
 
       for (const train of parsed) {
@@ -605,7 +756,7 @@ function searchJourneys(fromName, toName, dateStr) {
       return true;
     })
     .sort((a, b) => a.depM - b.depM)
-    .slice(0, 100);
+    .slice(0, 25);
 }
 
 // ─── REAL-TIME DELAY (IRIS) ────────────────────────────────────────────────
@@ -829,47 +980,39 @@ app.get('/api/itineraries', async (req, res) => {
 // ─── INFOFER TRAIN VALIDATION ─────────────────────────────────────────────
 // Check a single train number against InfoFer mers tren for a specific date.
 // Returns true if running, false if not found / not running on that date.
+// Check if a specific train runs on a specific date using IRIS MersTrenRo.aspx.
+// MersTrenRo.aspx is date-aware: it only shows station times for dates the train runs.
+// If the response has no time data, the train is NOT running that day.
 async function checkTrainOnInfoFer(trainNum, dateStr) {
   const cacheKey = `infofer:${trainNum}:${dateStr}`;
   const cached = cacheGet(cacheKey);
   if (cached !== null) return cached;
 
-  // Strategy 1: Try mersultrenurilor.infofer.ro/ro-RO/Tren/Info-tren
-  // This returns different HTML depending on whether train runs on that date
-  const url1 = `https://mersultrenurilor.infofer.ro/ro-RO/Tren/Info-tren?tren=${encodeURIComponent(trainNum)}&data=${encodeURIComponent(dateStr)}`;
+  // IRIS MersTrenRo.aspx — pass train number + date in DD.MM.YYYY format
+  // Returns the scheduled route for that specific date.
+  // If the train doesn't run, it returns empty or a very short error page.
+  const url = `http://appiris.infofer.ro/MersTrenRo.aspx?tren=${encodeURIComponent(trainNum)}&data=${encodeURIComponent(dateStr)}`;
   try {
-    const r1 = await get(url1, 8000);
-    const html1 = r1.body || '';
-    if (html1.length > 100) {
-      // Train NOT running indicators (Romanian InfoFer phrases)
-      const notRunning =
-        /nu circul[aă]/i.test(html1) ||
-        /nu exist[aă] informa/i.test(html1) ||
-        /trenul nu a fost g[aă]sit/i.test(html1) ||
-        /nu exist[aă] date/i.test(html1) ||
-        /eroare/i.test(html1) ||
-        // If response is extremely short with no timetable table, it's an error page
-        (html1.length < 1500 && !/<table/i.test(html1));
-      const running = !notRunning;
-      cacheSet(cacheKey, running, 3600);
-      return running;
-    }
-  } catch (e) { /* fall through to IRIS */ }
+    const r = await get(url, 8000);
+    const html = r.body || '';
 
-  // Strategy 2: Try IRIS - if it returns no station data, train doesn't run today
-  try {
-    const r2 = await get(IRIS_URL(trainNum), 6000);
-    const html2 = r2.body || '';
-    // IRIS returns a proper page with station table when train runs
-    // If no table rows with times, the train is not running
-    const hasStationData = /<tr[^>]*>[\s\S]{10,}<\/tr>/i.test(html2) &&
-                           /\d{2}:\d{2}/.test(html2);
-    cacheSet(cacheKey, hasStationData, 3600);
-    return hasStationData;
+    // A valid running train's page has time entries like "07:30" in a table
+    const hasTimes = /\d{2}:\d{2}/.test(html) && html.length > 500;
+
+    // Extra check: look for explicit "nu circulă" or "nu există"
+    const explicitNotRunning =
+      /nu circul[aă]/i.test(html) ||
+      /nu exist[aă]/i.test(html) ||
+      html.length < 200;
+
+    const running = hasTimes && !explicitNotRunning;
+    console.log(`[validate] train ${trainNum} on ${dateStr}: ${running ? 'RUNS' : 'GHOST'} (html=${html.length}b, hasTimes=${hasTimes})`);
+    cacheSet(cacheKey, running, 3600);
+    return running;
   } catch (e) {
-    // Both checks failed — fail open
+    console.log(`[validate] train ${trainNum} IRIS error: ${e.message} — fail open`);
     cacheSet(cacheKey, true, 300);
-    return true;
+    return true; // fail open — better to show than to hide valid trains
   }
 }
 
@@ -969,8 +1112,46 @@ app.get('/api/board/:stationName', async (req, res) => {
 
   const stName = req.params.stationName.trim();
   const n      = resolveStation(stName);
-  const nums   = stationIndex.get(n);
+  const gps    = stationGPS.get(n);
 
+  // ── PRIMARY: Try IRIS SosPlcRO.aspx — authoritative real departures ──────
+  // IRIS only returns trains that actually run today. No ghost trains possible.
+  const irisBoard = await getIRISStationBoard(stName);
+  if (irisBoard && irisBoard.length > 0) {
+    // Enrich IRIS data with our XML data (operator, full route, etc.)
+    const departures = irisBoard.map(d => {
+      const xmlTrain = trains.get(d.number);
+      return {
+        time:        d.time,
+        train:       `${d.category || xmlTrain?.category || ''} ${d.number}`.trim(),
+        trainNumber: d.number,
+        number:      d.number,
+        type:        xmlTrain?.type || d.category || '',
+        operator:    xmlTrain?.operator || '',
+        to:          d.to || (xmlTrain ? xmlTrain.stations[xmlTrain.stations.length-1].name : ''),
+        from:        xmlTrain ? xmlTrain.stations[0].name : '',
+        delay:       d.delay || 0,
+        platform:    d.platform || null,
+        isOrigin:    xmlTrain ? norm(xmlTrain.stations[0].name) === n : false,
+        isTerminus:  xmlTrain ? norm(xmlTrain.stations[xmlTrain.stations.length-1].name) === n : false,
+      };
+    });
+
+    return res.json({
+      station:   stName,
+      source:    'iris',
+      lat:       gps?.lat || null,
+      lng:       gps?.lng || null,
+      stationId: gps?.id  || null,
+      departures,
+      count:     departures.length,
+    });
+  }
+
+  // ── FALLBACK: XML data + date validation ─────────────────────────────────
+  // Used when IRIS is unavailable. We validate against InfoFer to filter ghosts.
+  console.log('[board] IRIS unavailable for', stName, '— falling back to XML');
+  const nums = stationIndex.get(n);
   if (!nums || nums.size === 0) {
     const q2 = norm(stName);
     const suggestions = [];
@@ -980,14 +1161,11 @@ app.get('/api/board/:stationName', async (req, res) => {
     return res.status(404).json({
       error: `Station "${stName}" not found`,
       suggestions: suggestions.slice(0, 5),
-      hint: 'Use /api/stations?q=... to find the correct name',
     });
   }
 
-  const date = todayStr(); // board always shows today
-
-  // Build raw departures list
-  const rawDepartures = [];
+  const date = todayStr();
+  const rawDeps = [];
   for (const tNum of nums) {
     const train = trains.get(tNum);
     if (!train) continue;
@@ -995,61 +1173,47 @@ app.get('/api/board/:stationName', async (req, res) => {
     if (!st) continue;
     const dep = st.dep || st.arr;
     if (!dep) continue;
-    rawDepartures.push({
-      time:     dep,
-      train:    `${train.category} ${train.number}`,
+    rawDeps.push({
+      time:        dep,
+      train:       `${train.category} ${train.number}`,
       trainNumber: train.number,
-      number:   train.number,
-      type:     train.type,
-      operator: train.operator,
-      from:     train.stations[0].name,
-      to:       train.stations[train.stations.length - 1].name,
-      arr:      train.stations[train.stations.length - 1].arr,
-      delay:    0,
+      number:      train.number,
+      type:        train.type,
+      operator:    train.operator,
+      from:        train.stations[0].name,
+      to:          train.stations[train.stations.length - 1].name,
+      delay:       0,
+      platform:    null,
+      isOrigin:    norm(train.stations[0].name) === n,
+      isTerminus:  norm(train.stations[train.stations.length - 1].name) === n,
     });
   }
 
-  // ── Validate against InfoFer for today ──────────────────────────────────
-  const allNums = [...new Set(rawDepartures.map(d => d.number).filter(Boolean))];
-  let validNums = new Set(allNums);
-  if (allNums.length > 0) {
-    try {
-      const validation = await validateTrains(allNums, date);
-      validNums = new Set(Object.entries(validation)
-        .filter(([, ok]) => ok)
-        .map(([num]) => num));
-    } catch (e) {
-      console.error('[board] validation error:', e.message);
-      // Fail open
-    }
-  }
+  // Filter by XML schedule (ZileSaptamana) — eliminates known non-running trains
+  const xmlFiltered = rawDeps.filter(d => {
+    const t = trains.get(d.number);
+    return t ? trainRunsOnDate(t, date) : true;
+  });
 
-  const departures = rawDepartures.filter(d => !d.number || validNums.has(d.number));
-  const gps = stationGPS.get(n);
+  // Validate remainder against InfoFer (network call — may fail open)
+  const allNums = [...new Set(xmlFiltered.map(d => d.number).filter(Boolean))];
+  let validNums = new Set(allNums);
+  try {
+    const validation = await validateTrains(allNums, date);
+    validNums = new Set(Object.entries(validation).filter(([,ok])=>ok).map(([n])=>n));
+  } catch (e) { console.error('[board fallback] validation error:', e.message); }
+
+  const departures = xmlFiltered.filter(d => !d.number || validNums.has(d.number));
   departures.sort((a, b) => timeToMins(a.time) - timeToMins(b.time));
 
-  // ── Enrich with live delay + platform from IRIS ────────────────────────
-  // Only fetch live for upcoming trains (first 20) to keep response fast
-  const nowM = timeToMins(todayStr()) || 0;
-  const toEnrich = departures.slice(0, 20);
-  await Promise.all(toEnrich.map(async dep => {
-    if (!dep.number) return;
-    try {
-      const live = await getLiveDelay(dep.number);
-      if (live && live.liveAvailable) {
-        dep.delay    = live.delay    || 0;
-        dep.platform = live.platform || null;
-      }
-    } catch (e) { /* keep delay=0 */ }
-  }));
-
   return res.json({
-    station:    stName,
-    lat:        gps?.lat || null,
-    lng:        gps?.lng || null,
-    stationId:  gps?.id  || null,
+    station:   stName,
+    source:    'xml',
+    lat:       gps?.lat || null,
+    lng:       gps?.lng || null,
+    stationId: gps?.id  || null,
     departures,
-    count:      departures.length,
+    count:     departures.length,
   });
 });
 
