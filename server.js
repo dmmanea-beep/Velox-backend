@@ -550,7 +550,7 @@ function searchJourneys(fromName, toName) {
       return true;
     })
     .sort((a, b) => a.depM - b.depM)
-    .slice(0, 25);
+    .slice(0, 100);
 }
 
 // ─── REAL-TIME DELAY (IRIS) ────────────────────────────────────────────────
