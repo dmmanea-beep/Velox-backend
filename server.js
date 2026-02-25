@@ -107,6 +107,50 @@ function durStr(mins) {
   return `${Math.floor(mins / 60)}h ${mins % 60}m`;
 }
 
+// Parse DD.MM.YYYY → JS Date object (noon, to avoid DST issues)
+function parseRoDate(str) {
+  if (!str) return null;
+  const [d, m, y] = str.split('.').map(Number);
+  if (!d || !m || !y) return null;
+  return new Date(y, m - 1, d, 12, 0, 0);
+}
+
+// Return day-of-week index 0=Sun,1=Mon...6=Sat for a DD.MM.YYYY date string
+function dateToDow(str) {
+  const d = parseRoDate(str);
+  return d ? d.getDay() : -1;
+}
+
+// ZileSaptamana in CFR XML is a string like "12345" meaning Mon–Fri,
+// or "1234567" meaning daily. Each digit = day number: 1=Mon, 2=Tue … 7=Sun.
+// Returns true if the given date (DD.MM.YYYY) falls on an operating day.
+function trainRunsOnDate(train, dateStr) {
+  if (!train.schedule || train.schedule.length === 0) return true; // no data = assume runs
+  const dow = dateToDow(dateStr); // 0=Sun … 6=Sat
+  // Convert JS dow (0=Sun) to CFR dow (1=Mon … 7=Sun)
+  const cfrDow = dow === 0 ? 7 : dow; // Sun→7, Mon→1 … Sat→6
+
+  const targetDate = parseRoDate(dateStr);
+
+  for (const sch of train.schedule) {
+    // Check date range
+    if (sch.dateStart && sch.dateEnd) {
+      const ds = parseRoDate(sch.dateStart);
+      const de = parseRoDate(sch.dateEnd);
+      if (targetDate && ds && de) {
+        if (targetDate < ds || targetDate > de) continue; // outside this schedule's window
+      }
+    }
+    // Check day of week bitmask
+    if (sch.days && sch.days.length > 0) {
+      if (sch.days.includes(String(cfrDow))) return true;
+    } else {
+      return true; // schedule exists but no day restriction = runs every day in range
+    }
+  }
+  return false;
+}
+
 // Normalize station name for fuzzy matching (remove diacritics, lowercase)
 function norm(name) {
   return (name || '').trim()
@@ -278,7 +322,8 @@ function parseCFRXml(xml, defaultOperator) {
 }
 
 // Better approach: build stop list by collecting all unique origin stations
-// in sequence order, then add final destination from the last element
+// in sequence order, then add final destination from the last element.
+// Also extracts ZileSaptamana (days of week) and date range from <Trasa> elements.
 function parseCFRXmlV2(xml, defaultOperator) {
   const result = [];
   const trainRe = /<Tren\b([^>]*)>([\s\S]*?)<\/Tren>/g;
@@ -295,6 +340,26 @@ function parseCFRXmlV2(xml, defaultOperator) {
     const number   = numM[1].trim();
     const category = catM ? catM[1].trim() : '';
 
+    // ── Extract schedule (days of operation) from <Trasa> elements ──────
+    // <Trasa ZileSaptamana="12345" DataInceput="01.12.2025" DataSfarsit="14.06.2026">
+    // ZileSaptamana: 1=Mon,2=Tue,3=Wed,4=Thu,5=Fri,6=Sat,7=Sun
+    const schedule = [];
+    const trasaRe = /<Trasa\b([^>]*)>/g;
+    let trasaM;
+    while ((trasaM = trasaRe.exec(body)) !== null) {
+      const ta = trasaM[1];
+      const daysM  = ta.match(/ZileSaptamana="([^"]+)"/);
+      const startM = ta.match(/DataInceput="([^"]+)"/);
+      const endM   = ta.match(/DataSfarsit="([^"]+)"/)
+                  || ta.match(/DataFinal="([^"]+)"/)
+                  || ta.match(/DataSfir="([^"]+)"/);
+      schedule.push({
+        days:      daysM  ? daysM[1].trim()  : '',
+        dateStart: startM ? startM[1].trim() : '',
+        dateEnd:   endM   ? endM[1].trim()   : '',
+      });
+    }
+
     // Collect all ElementTrasa in order
     const allElems = [...body.matchAll(/<ElementTrasa\b([^>]*)\/>/g)];
     if (allElems.length === 0) continue;
@@ -305,50 +370,36 @@ function parseCFRXmlV2(xml, defaultOperator) {
       const ea    = em[1];
       const oName = (ea.match(/DenStaOrigine="([^"]+)"/) || [])[1];
       const dName = (ea.match(/DenStaDestinatie="([^"]+)"/) || [])[1];
-      const oraS  = (ea.match(/OraS="([^"]+)"/) || [])[1]; // arrival at origin in seconds
-      const oraP  = (ea.match(/OraP="([^"]+)"/) || [])[1]; // departure from origin in seconds
+      const oraS  = (ea.match(/OraS="([^"]+)"/) || [])[1];
+      const oraP  = (ea.match(/OraP="([^"]+)"/) || [])[1];
 
       if (!oName) return;
 
-      // Add origin station (each unique stop once)
       const lastSt = stations[stations.length - 1];
       if (!lastSt || norm(lastSt.name) !== norm(oName)) {
-        stations.push({
-          name: oName,
-          arr:  secToTime(oraS),
-          dep:  secToTime(oraP),
-        });
+        stations.push({ name: oName, arr: secToTime(oraS), dep: secToTime(oraP) });
       } else {
-        // Same station — update times if missing
         if (!lastSt.arr && oraS) lastSt.arr = secToTime(oraS);
         if (!lastSt.dep && oraP) lastSt.dep = secToTime(oraP);
       }
 
-      // On the last element, also add the destination
       if (idx === allElems.length - 1 && dName) {
-        // Try to get destination arrival time from OraSD (Ora Sosire Destinatie)
-        // or fallback to computing from travel time fields
-        const oraSD = (ea.match(/OraSD=\"([^\"]+)\"/) || [])[1]  // some XML variants
-                    || (ea.match(/OraSosireDestinatie=\"([^\"]+)\"/) || [])[1]
-                    || (ea.match(/OraSDest=\"([^\"]+)\"/) || [])[1];
+        const oraSD = (ea.match(/OraSD="([^"]+)"/) || [])[1]
+                    || (ea.match(/OraSosireDestinatie="([^"]+)"/) || [])[1]
+                    || (ea.match(/OraSDest="([^"]+)"/) || [])[1];
         if (norm(dName) !== norm(oName)) {
-          stations.push({
-            name: dName,
-            arr:  oraSD ? secToTime(oraSD) : null,
-            dep:  null,
-          });
+          stations.push({ name: dName, arr: oraSD ? secToTime(oraSD) : null, dep: null });
         }
       }
     });
 
     if (stations.length >= 2) {
-      result.push({ number, category, type: guessType(category), operator: defaultOperator, stations });
+      result.push({ number, category, type: guessType(category), operator: defaultOperator, stations, schedule });
     }
   }
 
   return result;
 }
-
 // ─── LOAD DATA ─────────────────────────────────────────────────────────────
 async function loadData() {
   loadStatus = 'loading GPS...';
@@ -410,7 +461,7 @@ async function loadData() {
 }
 
 // ─── JOURNEY SEARCH ────────────────────────────────────────────────────────
-function findDirectJourneys(fromNorm, toNorm) {
+function findDirectJourneys(fromNorm, toNorm, dateStr) {
   const fromSet = stationIndex.get(fromNorm) || new Set();
   const toSet   = stationIndex.get(toNorm)   || new Set();
   const results = [];
@@ -420,6 +471,10 @@ function findDirectJourneys(fromNorm, toNorm) {
 
     const train = trains.get(tNum);
     if (!train) continue;
+
+    // ── Day-of-operation check ───────────────────────────────────────────
+    // Skip trains that don't run on the searched date
+    if (dateStr && !trainRunsOnDate(train, dateStr)) continue;
 
     // Find the indices of from/to in this train's station list
     const fi = train.stations.findIndex(s => norm(s.name) === fromNorm);
@@ -458,14 +513,14 @@ function findDirectJourneys(fromNorm, toNorm) {
   return results.sort((a, b) => a.depM - b.depM);
 }
 
-function searchJourneys(fromName, toName) {
+function searchJourneys(fromName, toName, dateStr) {
   const fN = resolveStation(fromName);
   const tN = resolveStation(toName);
 
   const journeys = [];
 
-  // Direct
-  const directs = findDirectJourneys(fN, tN);
+  // Direct (filtered by date)
+  const directs = findDirectJourneys(fN, tN, dateStr);
   for (const d of directs) {
     journeys.push({
       dep: d.dep, arr: d.arr,
@@ -511,8 +566,8 @@ function searchJourneys(fromName, toName) {
     }
 
     for (const via of [...candidates].slice(0, 20)) {
-      const leg1s = findDirectJourneys(fN, via);
-      const leg2s = findDirectJourneys(via, tN);
+      const leg1s = findDirectJourneys(fN, via, dateStr);
+      const leg2s = findDirectJourneys(via, tN, dateStr);
 
       for (const l1 of leg1s.slice(0, 8)) {
         for (const l2 of leg2s.slice(0, 8)) {
@@ -550,7 +605,7 @@ function searchJourneys(fromName, toName) {
       return true;
     })
     .sort((a, b) => a.depM - b.depM)
-    .slice(0, 100);
+    .slice(0, 25);
 }
 
 // ─── REAL-TIME DELAY (IRIS) ────────────────────────────────────────────────
@@ -695,10 +750,78 @@ app.get('/api/itineraries', (req, res) => {
   const cached = cacheGet(key);
   if (cached) return res.json({ source: 'cache', from, to, date, journeys: cached, count: cached.length });
 
-  const journeys = searchJourneys(from, to);
+  const journeys = searchJourneys(from, to, date);
   cacheSet(key, journeys, 300); // cache 5 minutes
 
   return res.json({ source: 'live', from, to, date, journeys, count: journeys.length });
+});
+
+// GET /api/validate-trains?numbers=532,1234,456&date=25.02.2026
+// Validates a batch of train numbers against InfoFer for the given date.
+// Returns { results: { "532": true, "1234": false, ... } }
+// Uses mersultrenurilor.infofer.ro which shows "nu circulă" for non-running trains.
+app.get('/api/validate-trains', async (req, res) => {
+  const numbersRaw = (req.query.numbers || '').trim();
+  const date = (req.query.date || todayStr()).trim();
+  if (!numbersRaw) return res.json({ results: {} });
+
+  const numbers = numbersRaw.split(',').map(n => n.trim()).filter(Boolean).slice(0, 15);
+  const results = {};
+
+  // First check schedule data we already have from XML
+  const needsRemoteCheck = [];
+  for (const num of numbers) {
+    const train = trains.get(num);
+    if (!train) {
+      results[num] = false; // not in our DB at all
+      continue;
+    }
+    if (train.schedule && train.schedule.length > 0) {
+      // We have schedule data — use it
+      results[num] = trainRunsOnDate(train, date);
+    } else {
+      // No schedule data in XML — need to check InfoFer
+      needsRemoteCheck.push(num);
+      results[num] = true; // optimistic default
+    }
+  }
+
+  // For trains without schedule data, check InfoFer in parallel (max 5 at once)
+  if (needsRemoteCheck.length > 0) {
+    const INFOFER_URL = (num, d) =>
+      `https://mersultrenurilor.infofer.ro/ro-RO/Tren/Info-tren?tren=${encodeURIComponent(num)}&data=${encodeURIComponent(d)}`;
+
+    const checkBatch = async (nums) => {
+      await Promise.all(nums.map(async (num) => {
+        try {
+          const r = await get(INFOFER_URL(num, date), 6000);
+          const html = r.body || '';
+          // Not running indicators in InfoFer HTML
+          const notRunning =
+            /nu circulă/i.test(html) ||
+            /nu circula/i.test(html) ||
+            /nu există/i.test(html) ||
+            /nu exista/i.test(html) ||
+            /Eroare/i.test(html) ||
+            /not found/i.test(html) ||
+            html.length < 500; // very short response = error page
+          results[num] = !notRunning;
+        } catch (e) {
+          results[num] = true; // if check fails, assume running (don't hide trains)
+        }
+      }));
+    };
+
+    // Process in batches of 5
+    for (let i = 0; i < needsRemoteCheck.length; i += 5) {
+      await checkBatch(needsRemoteCheck.slice(i, i + 5));
+    }
+  }
+
+  const cacheKey = `validate:${date}:${numbers.sort().join(',')}`;
+  cacheSet(cacheKey, results, 3600); // cache 1 hour
+
+  return res.json({ date, results, checked: numbers.length });
 });
 
 // GET /api/train/1581  — full scheduled route
