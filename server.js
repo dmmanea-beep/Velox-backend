@@ -893,6 +893,111 @@ app.get('/api/debug/:trainNumber', async (req, res) => {
   });
 });
 
+// GET /api/test-train?n=1581&d=26.02.2026 — test IRIS for a specific train/date
+app.get('/api/test-train', async (req, res) => {
+  const num  = (req.query.n || '').trim();
+  const date = (req.query.d || todayStr()).trim();
+  if (!num) return res.json({ error: 'n= required' });
+  
+  const results = { num, date };
+  
+  // Check IRIS MersTrenRo with date
+  try {
+    const url1 = `http://appiris.infofer.ro/MersTrenRo.aspx?tren=${encodeURIComponent(num)}&data=${encodeURIComponent(date)}`;
+    const r1 = await get(url1, 8000);
+    results.irisMersTren = {
+      url: url1, status: r1.status, length: r1.body.length,
+      hasTimes: /\d{2}:\d{2}/.test(r1.body),
+      first300: r1.body.slice(0, 300).replace(/\s+/g, ' '),
+    };
+  } catch(e) { results.irisMersTren = { error: e.message }; }
+  
+  // Check IRIS MyTrainRO (live position - no date)
+  try {
+    const url2 = IRIS_URL(num);
+    const r2 = await get(url2, 8000);
+    results.irisMyTrain = {
+      url: url2, status: r2.status, length: r2.body.length,
+      hasTimes: /\d{2}:\d{2}/.test(r2.body),
+      first300: r2.body.slice(0, 300).replace(/\s+/g, ' '),
+    };
+  } catch(e) { results.irisMyTrain = { error: e.message }; }
+  
+  // Check our XML data
+  const train = trains.get(num);
+  results.xmlData = train ? {
+    schedule: train.schedule,
+    scheduleCount: train.schedule ? train.schedule.length : 0,
+    trainRunsOnDate: trainRunsOnDate(train, date),
+    stations: train.stations.length,
+  } : { error: 'not in XML' };
+  
+  // Check validation result
+  results.validationResult = await checkTrainOnInfoFer(num, date);
+  
+  res.json(results);
+});
+
+// GET /api/xmltest — diagnose XML structure and IRIS connectivity
+app.get('/api/xmltest', async (req, res) => {
+  const results = {};
+  
+  // Test 1: Check IRIS connectivity with a known train
+  try {
+    const irisUrl = `http://appiris.infofer.ro/MersTrenRo.aspx?tren=1581&data=${todayStr()}`;
+    const r = await get(irisUrl, 8000);
+    results.iris = {
+      status: r.status,
+      length: r.body.length,
+      hasTimes: /\d{2}:\d{2}/.test(r.body),
+      first200: r.body.slice(0, 200).replace(/\s+/g, ' '),
+    };
+  } catch(e) { results.iris = { error: e.message }; }
+  
+  // Test 2: Check XML structure
+  try {
+    const xmlR = await get(XML_SOURCES[0].url, 30000);
+    const xml = xmlR.body || '';
+    results.xml = {
+      length: xml.length,
+      hasZileSaptamana: xml.includes('ZileSaptamana'),
+      hasTrasa: xml.includes('<Trasa'),
+      hasPerioda: xml.includes('Perioada'),
+      // Show first <Tren> element raw
+      firstTren: (xml.match(/<Tren\b[^>]*>[\s\S]{0,800}?<\/Tren>/) || ['not found'])[0],
+      // Show first 500 chars
+      first500: xml.slice(0, 500),
+    };
+    // Count trains with schedule
+    let withSched = 0, total = 0;
+    const re = /<Tren\b[^>]*>([\s\S]*?)<\/Tren>/g;
+    let m;
+    while ((m = re.exec(xml)) !== null && total < 100) {
+      total++;
+      if (/ZileSaptamana/.test(m[1])) withSched++;
+    }
+    results.xml.trainsChecked = total;
+    results.xml.withSchedule = withSched;
+    results.xml.percentWithSchedule = Math.round(withSched/total*100) + '%';
+  } catch(e) { results.xml = { error: e.message }; }
+  
+  // Test 3: Check our in-memory schedule data for sample trains
+  const sampleNums = [...trains.keys()].slice(0, 5);
+  results.sampleTrains = sampleNums.map(n => {
+    const t = trains.get(n);
+    return { 
+      number: n, 
+      scheduleEntries: t.schedule ? t.schedule.length : 0,
+      schedule: t.schedule,
+      runsToday: trainRunsOnDate(t, todayStr()),
+    };
+  });
+  results.totalTrains = trains.size;
+  results.today = todayStr();
+  
+  res.json(results);
+});
+
 // GET /api/stations?q=Brasov
 app.get('/api/stations', (req, res) => {
   const q = norm(req.query.q || '');
