@@ -20,10 +20,6 @@ const XML_SOURCES = [
     url: 'https://data.gov.ro/dataset/b4e2ce0b-6935-44b1-8e9d-f3999123358a/resource/1a083cf5-d37c-4618-aeb8-3f1ba0dd22dc/download/trenuri-2025-2026_interregional-calatori.xml'
   },
   {
-    operator: 'Ferotrafic TFI',
-    url: 'https://data.gov.ro/dataset/019ecd94-b7ce-46e5-a003-7e4db3180147/resource/6f986175-fab4-4b2b-a57c-f04094ee9cfd/download/trenuri-2025-2026_ferotrafictfi.xml'
-  },
-  {
     operator: 'Regio Călători',
     url: 'https://data.gov.ro/dataset/1da1018d-df38-4b5f-9667-88e4521abfb3/resource/771c1e7f-e552-46aa-8a6b-b9276b9b556c/download/trenuri-2025-2026_regio-calatori.xml'
   },
@@ -330,16 +326,15 @@ function parseCFRXmlV2(xml, defaultOperator) {
 
       // On the last element, also add the destination
       if (idx === allElems.length - 1 && dName) {
-        // The destination arrival time — we need it from the context
-        // In CFR XML, for the final stop, the arrival is stored differently
-        // We can approximate: find OraS of this element as departure, then
-        // compute from StationareSecunde and next segment
-        // Actually the simplest: the destination is the last CodStaFinala
-        // For now just add it with arrival = null (will show as terminus)
+        // Try to get destination arrival time from OraSD (Ora Sosire Destinatie)
+        // or fallback to computing from travel time fields
+        const oraSD = (ea.match(/OraSD=\"([^\"]+)\"/) || [])[1]  // some XML variants
+                    || (ea.match(/OraSosireDestinatie=\"([^\"]+)\"/) || [])[1]
+                    || (ea.match(/OraSDest=\"([^\"]+)\"/) || [])[1];
         if (norm(dName) !== norm(oName)) {
           stations.push({
             name: dName,
-            arr:  null, // final destination
+            arr:  oraSD ? secToTime(oraSD) : null,
             dep:  null,
           });
         }
@@ -433,10 +428,12 @@ function findDirectJourneys(fromNorm, toNorm) {
 
     const dep = train.stations[fi].dep || train.stations[fi].arr;
     const arr = train.stations[ti].arr || train.stations[ti].dep;
-    if (!dep || !arr) continue;
+    if (!dep) continue;
+    // If arrival is still null (final terminus with unknown time), estimate from dep + 1 min
+    const arrFinal = arr || dep;
 
     const depM = timeToMins(dep);
-    const arrM = timeToMins(arr);
+    const arrM = timeToMins(arrFinal);
     const durM = arrM >= depM ? arrM - depM : arrM + 1440 - depM;
 
     // Attach GPS to stops
@@ -446,7 +443,7 @@ function findDirectJourneys(fromNorm, toNorm) {
     });
 
     results.push({
-      dep, arr, depM, arrM, durM,
+      dep, arr: arrFinal, depM, arrM, durM,
       label:    `${train.category} ${train.number}`,
       number:   train.number,
       category: train.category,
@@ -490,8 +487,8 @@ function searchJourneys(fromName, toName) {
     });
   }
 
-  // 1 change — look for via stations
-  if (directs.length < 4) {
+  // 1 change — always search for connections, not just when few directs found
+  {
     const fromTrains = stationIndex.get(fN) || new Set();
     const toTrains   = stationIndex.get(tN)  || new Set();
 
@@ -513,12 +510,12 @@ function searchJourneys(fromName, toName) {
       });
     }
 
-    for (const via of [...candidates].slice(0, 10)) {
+    for (const via of [...candidates].slice(0, 20)) {
       const leg1s = findDirectJourneys(fN, via);
       const leg2s = findDirectJourneys(via, tN);
 
-      for (const l1 of leg1s.slice(0, 5)) {
-        for (const l2 of leg2s.slice(0, 5)) {
+      for (const l1 of leg1s.slice(0, 8)) {
+        for (const l2 of leg2s.slice(0, 8)) {
           const wait = l2.depM - l1.arrM;
           if (wait < 5 || wait > 180) continue; // 5min–3h connection window
 
@@ -552,8 +549,8 @@ function searchJourneys(fromName, toName) {
       seen.add(k);
       return true;
     })
-    .sort((a, b) => a.durationMins - b.durationMins)
-    .slice(0, 12);
+    .sort((a, b) => a.depM - b.depM)
+    .slice(0, 25);
 }
 
 // ─── REAL-TIME DELAY (IRIS) ────────────────────────────────────────────────
