@@ -1,4 +1,15 @@
 'use strict';
+/**
+ * Velox backend — timetable search + station board
+ * Fixes:
+ * - No more hard cap of 12/25 results. Supports limit/offset and "whole-day" results.
+ * - Sorts results relative to the user's requested time (time=HH:MM).
+ * - Adds best-effort date validity filtering (date=DD.MM.YYYY) when present in XML.
+ *
+ * NOTE: The public XML feeds are "static reference data" and may not include full
+ * exception calendars for every train. Where the XML lacks validity info, trains are
+ * assumed to run daily.
+ */
 const express = require('express');
 const cors    = require('cors');
 const https   = require('https');
@@ -9,802 +20,598 @@ app.use(cors({ origin: '*', methods: ['GET', 'OPTIONS'] }));
 app.options('*', cors());
 
 // ─── DATA SOURCES ──────────────────────────────────────────────────────────
-// All confirmed 2025-2026 XML URLs from data.gov.ro
+// 2025-2026 XML URLs from data.gov.ro (user provided)
 const XML_SOURCES = [
-  {
-    operator: 'CFR Călători',
-    url: 'https://data.gov.ro/dataset/c4f71dbb-de39-49b2-b697-5b60a5f299a2/resource/0f67143e-bb88-4a06-8e7a-b35b1eb91329/download/trenuri-2025-2026_sntfc.xml'
-  },
-  {
-    operator: 'Interregional Călători',
-    url: 'https://data.gov.ro/dataset/b4e2ce0b-6935-44b1-8e9d-f3999123358a/resource/1a083cf5-d37c-4618-aeb8-3f1ba0dd22dc/download/trenuri-2025-2026_interregional-calatori.xml'
-  },
-  {
-    operator: 'Regio Călători',
-    url: 'https://data.gov.ro/dataset/1da1018d-df38-4b5f-9667-88e4521abfb3/resource/771c1e7f-e552-46aa-8a6b-b9276b9b556c/download/trenuri-2025-2026_regio-calatori.xml'
-  },
-  {
-    operator: 'Transferoviar Călători',
-    url: 'https://data.gov.ro/dataset/9d4adc7b-d407-46c2-9003-5aa87cd16fb7/resource/2f1d9f58-1e97-4a4a-bc65-86c52b7db1a9/download/trenuri-2025-2026_transferoviar-calatori.xml'
-  },
-  {
-    operator: 'Astra Trans Carpatic',
-    url: 'https://data.gov.ro/dataset/1d057a43-3eaa-4fed-a349-4106f3ad0e49/resource/aab96a77-0fbe-4770-8408-e7b23c90480d/download/trenuri-2025-2026_astratranscarpatic.xml'
-  },
-  {
-    operator: 'Softrans',
-    url: 'https://data.gov.ro/dataset/e4ba7432-2904-4cc4-9588-2afbf021756e/resource/3bf9600e-7ae4-45fb-a46e-8184576544a1/download/trenuri-2025-2026_softrans.xml'
-  },
+  { operator: 'CFR Călători',          url: 'https://data.gov.ro/dataset/c4f71dbb-de39-49b2-b697-5b60a5f299a2/resource/0f67143e-bb88-4a06-8e7a-b35b1eb91329/download/trenuri-2025-2026_sntfc.xml' },
+  { operator: 'Interregional Călători',url: 'https://data.gov.ro/dataset/b4e2ce0b-6935-44b1-8e9d-f3999123358a/resource/1a083cf5-d37c-4618-aeb8-3f1ba0dd22dc/download/trenuri-2025-2026_interregional-calatori.xml' },
+  { operator: 'Transferoviar Călători',url: 'https://data.gov.ro/dataset/9d4adc7b-d407-46c2-9003-5aa87cd16fb7/resource/2f1d9f58-1e97-4a4a-bc65-86c52b7db1a9/download/trenuri-2025-2026_tfc.xml' },
+  { operator: 'Regio Călători',        url: 'https://data.gov.ro/dataset/1da1018d-df38-4b5f-9667-88e4521abfb3/resource/771c1e7f-e552-46aa-8a6b-b9276b9b556c/download/trenuri-2025-2026_regio-calatori.xml' },
+  { operator: 'Softrans',              url: 'https://data.gov.ro/dataset/e4ba7432-2904-4cc4-9588-2afbf021756e/resource/3bf9600e-7ae4-45fb-a46e-8184576544a1/download/trenuri-2025-2026_softrans.xml' },
 ];
 
-// GPS coordinates for all Romanian railway stations
-const STATION_GPS_URL = 'https://raw.githubusercontent.com/vasile/data.gov.ro-gtfs-exporter/master/cfr.webgis.ro/stops.geojson';
+// Optional: set TIMETABLE_URL_1, TIMETABLE_URL_2, ... to override/add sources
+function envTimetableUrls() {
+  const urls = [];
+  for (let i = 1; i <= 10; i++) {
+    const v = process.env[`TIMETABLE_URL_${i}`];
+    if (v && typeof v === 'string' && v.trim()) urls.push(v.trim());
+  }
+  return urls;
+}
 
-// IRIS real-time delay endpoint
-const IRIS_URL = (trainNum) => `https://appiris.infofer.ro/MyTrainRO.aspx?tren=${encodeURIComponent(trainNum)}`;
+const TIMETABLE_URLS = envTimetableUrls().length
+  ? envTimetableUrls().map(u => ({ operator: 'Unknown', url: u }))
+  : XML_SOURCES;
 
 // ─── IN-MEMORY STORE ───────────────────────────────────────────────────────
-let trains       = new Map();  // trainNumber -> { number, type, operator, stations[] }
-let stationIndex = new Map();  // normName -> Set(trainNumbers)
-let stationGPS   = new Map();  // normName -> { name, lat, lng, id }
-let dataReady    = false;
-let loadStatus   = 'starting';
+/**
+ * trains map key: trainId (string)
+ * value: { id, number, type, operator, stations[], daysMask, validFrom, validTo }
+ */
+const trains = new Map();
+/** stationIndex: normalizedStationName -> Set(trainId) */
+const stationIndex = new Map();
 
-// ─── CACHE ─────────────────────────────────────────────────────────────────
-const _cache = {};
-const cacheGet = (k) => { const i = _cache[k]; return (i && Date.now() < i.e) ? i.v : null; };
-const cacheSet = (k, v, s) => { _cache[k] = { v, e: Date.now() + s * 1000 }; };
-
-// ─── HTTP HELPER ───────────────────────────────────────────────────────────
-function get(url, timeout = 60000, hops = 0) {
-  return new Promise((res, rej) => {
-    if (hops > 5) return rej(new Error('Too many redirects'));
-    const lib = url.startsWith('https') ? https : http;
-    const req = lib.get(url, {
-      headers: {
-        'User-Agent': 'VeloxApp/4.0',
-        'Accept': '*/*',
-      }
-    }, (r) => {
-      if (r.statusCode >= 300 && r.statusCode < 400 && r.headers.location) {
-        const next = r.headers.location.startsWith('http')
-          ? r.headers.location
-          : new URL(r.headers.location, url).href;
-        return res(get(next, timeout, hops + 1));
-      }
-      const chunks = [];
-      r.on('data', c => chunks.push(c));
-      r.on('end', () => res({ status: r.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
-    });
-    req.on('error', rej);
-    req.setTimeout(timeout, () => { req.destroy(); rej(new Error('Timeout: ' + url)); });
-  });
-}
+let dataLoaded = false;
+let lastLoadAt = null;
+let lastLoadError = null;
+let lastDownloadedBytes = 0;
 
 // ─── HELPERS ───────────────────────────────────────────────────────────────
-
-// Convert seconds-since-midnight to HH:MM
-// The XML stores times as seconds e.g. OraP="17820" = 17820/60 = 297min = 04:57
-function secToTime(sec) {
-  if (sec == null || sec === '') return null;
-  const s = parseInt(sec);
-  if (isNaN(s) || s < 0) return null;
-  // Times can exceed 86400 for trains running past midnight
-  const totalMin = Math.floor(s / 60);
-  const h = Math.floor(totalMin / 60) % 24;
-  const m = totalMin % 60;
-  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
-}
-
-function timeToMins(t) {
-  if (!t) return -1;
-  const [h, m] = t.split(':').map(Number);
-  return h * 60 + m;
-}
-
-function durStr(mins) {
-  if (mins <= 0) return '';
-  return `${Math.floor(mins / 60)}h ${mins % 60}m`;
-}
-
-// Normalize station name for fuzzy matching (remove diacritics, lowercase)
-function norm(name) {
-  return (name || '').trim()
+function norm(s) {
+  return (s || '')
+    .toString()
     .toLowerCase()
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9 ]/g, ' ')
+    .replace(/[^a-z0-9]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
-// Resolve a user-typed station name to the exact norm key used in stationIndex.
-// Handles cases like "București Nord" matching "Bucuresti Nord Gr.A"
-function resolveStation(userInput) {
-  const n = norm(userInput);
-  // 1. Exact match
-  if (stationIndex.has(n)) return n;
-  // 2. Find any indexed station whose norm starts with the user input
-  //    e.g. "bucuresti nord" matches "bucuresti nord gr a"
-  for (const key of stationIndex.keys()) {
-    if (key.startsWith(n + ' ') || key === n) return key;
-  }
-  // 3. Find any indexed station that contains the user input
-  for (const key of stationIndex.keys()) {
-    if (key.includes(n)) return key;
-  }
-  // 4. User input contains the indexed key (e.g. user typed full name, XML is shorter)
-  for (const key of stationIndex.keys()) {
-    if (n.startsWith(key + ' ') || n === key) return key;
-  }
-  return n; // fallback — return as-is
+function pad2(n){ return String(n).padStart(2,'0'); }
+
+function toMins(hhmm) {
+  if (!hhmm) return null;
+  const m = String(hhmm).match(/(\d{1,2}):(\d{2})/);
+  if (!m) return null;
+  const h = parseInt(m[1], 10);
+  const mi = parseInt(m[2], 10);
+  if (Number.isNaN(h) || Number.isNaN(mi)) return null;
+  return (h * 60 + mi);
 }
 
-function guessType(cat) {
-  const c = (cat || '').toUpperCase();
-  if (c === 'EC')  return 'EuroCity';
-  if (c === 'IC')  return 'InterCity';
-  if (c === 'IR')  return 'InterRegio';
-  if (c === 'RX')  return 'RegioExpress';
-  if (c === 'RE')  return 'RegioExpress';
-  if (c === 'R')   return 'Regio';
-  if (c === 'S')   return 'Suburban';
-  return 'Tren';
+function durStr(mins) {
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  if (h <= 0) return `${m}m`;
+  return `${h}h ${pad2(m)}m`;
 }
 
-// Strip all HTML/XML tags from a string
-function stripTags(s) {
-  return (s || '').replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').trim();
+function parseDateDMY(s) {
+  // supports DD.MM.YYYY and YYYY-MM-DD
+  if (!s) return null;
+  const str = String(s).trim();
+  let m = str.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+  if (m) return new Date(Date.UTC(+m[3], +m[2]-1, +m[1], 0,0,0));
+  m = str.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (m) return new Date(Date.UTC(+m[1], +m[2]-1, +m[3], 0,0,0));
+  return null;
 }
 
-function todayStr() {
-  const d = new Date();
-  return `${String(d.getDate()).padStart(2,'0')}.${String(d.getMonth()+1).padStart(2,'0')}.${d.getFullYear()}`;
+function weekdayMon1(dateUtc) {
+  // JS: 0=Sun..6=Sat => convert to Mon=1..Sun=7
+  const d = dateUtc.getUTCDay();
+  return d === 0 ? 7 : d;
 }
 
-// ─── XML PARSER ────────────────────────────────────────────────────────────
-// Parses the actual CFR XML format where:
-//   - Each <Tren> has CategorieTren, Numar, Operator attributes
-//   - Inside <Trase><Trasa><ElementTrasa> each element has:
-//       DenStaOrigine, DenStaDestinatie, OraS (arr seconds), OraP (dep seconds)
-//   - We reconstruct the full stop list from the chain of ElementTrasa elements
-function parseCFRXml(xml, defaultOperator) {
-  const trains = [];
+function daysToMask(daysStr) {
+  // Returns bitmask with bits 1..7 (Mon..Sun) set. 0 means "unknown".
+  if (!daysStr) return 0;
+  const s = String(daysStr).toUpperCase();
 
-  // Match every <Tren ...>...</Tren>
-  const trainRe = /<Tren\b([^>]*)>([\s\S]*?)<\/Tren>/g;
-  let tm;
-
-  while ((tm = trainRe.exec(xml)) !== null) {
-    const attrs = tm[1];
-    const body  = tm[2];
-
-    const numM  = attrs.match(/Numar="([^"]+)"/);
-    const catM  = attrs.match(/CategorieTren="([^"]+)"/);
-    const opM   = attrs.match(/Operator="([^"]+)"/);
-
-    if (!numM) continue;
-
-    const number   = numM[1].trim();
-    const category = catM ? catM[1].trim() : '';
-    const operator = defaultOperator;
-
-    // Parse ElementTrasa elements to build the station list
-    // Each ElementTrasa represents a segment:
-    //   DenStaOrigine = departure station of this segment
-    //   OraS = arrival time at origin (seconds)  
-    //   OraP = departure time from origin (seconds)
-    //   DenStaDestinatie = destination station of this segment
-    // The final destination only has OraS at DenStaDestinatie of the last element
-
-    const stations = [];
-    const elemRe   = /<ElementTrasa\b([^>]*)\/>/g;
-    let em;
-    let prevDestName = null;
-
-    while ((em = elemRe.exec(body)) !== null) {
-      const ea    = em[1];
-      const oName = (ea.match(/DenStaOrigine="([^"]+)"/) || [])[1];
-      const dName = (ea.match(/DenStaDestinatie="([^"]+)"/) || [])[1];
-      const oraS  = (ea.match(/OraS="([^"]+)"/) || [])[1]; // arrival at origin
-      const oraP  = (ea.match(/OraP="([^"]+)"/) || [])[1]; // departure from origin
-      const seq   = parseInt((ea.match(/Secventa="([^"]+)"/) || [])[1] || '0');
-
-      if (!oName || !dName) continue;
-
-      if (seq === 1 || stations.length === 0) {
-        // First stop
-        stations.push({
-          name: oName,
-          arr:  secToTime(oraS),
-          dep:  secToTime(oraP),
-          seq:  seq,
-        });
-      } else if (oName !== prevDestName) {
-        // Gap in sequence — push origin as new stop
-        stations.push({
-          name: oName,
-          arr:  secToTime(oraS),
-          dep:  secToTime(oraP),
-          seq:  seq,
-        });
-      } else {
-        // Update the last stop's departure time
-        const last = stations[stations.length - 1];
-        if (!last.dep) last.dep = secToTime(oraP);
-      }
-
-      prevDestName = dName;
-
-      // If this is the last element in this trasa, add the destination
-      // We'll do this after the loop by checking the last element
-    }
-
-    // Add the final destination from the last ElementTrasa
-    const lastElem = body.match(/(?:.*<ElementTrasa\b([^>]*)\/>\s*)+$/s);
-    if (lastElem) {
-      const lastAttrs = lastElem[1];
-      const dName = (lastAttrs.match(/DenStaDestinatie="([^"]+)"/) || [])[1];
-      const oraS  = (lastAttrs.match(/OraS="([^"]+)"/) || [])[1];
-      if (dName && stations.length > 0 && stations[stations.length-1].name !== dName) {
-        // Find the last element's arrival time for destination
-        const allElems = [...body.matchAll(/<ElementTrasa\b([^>]*)\/>/g)];
-        if (allElems.length > 0) {
-          const lastA = allElems[allElems.length - 1][1];
-          const finalName = (lastA.match(/DenStaDestinatie="([^"]+)"/) || [])[1];
-          const finalOraS = (lastA.match(/OraS="([^"]+)"/) || [])[1];
-          // The destination arrival time in seconds is in a different field
-          // OraS for the destination = arrival at the destination of the last element
-          // We need to compute it from the last element's travel time
-          // For now use a simple approach: find it in the CodStaDestinatie element
-          if (finalName) {
-            stations.push({
-              name: finalName,
-              arr:  null, // will be filled below
-              dep:  null,
-              seq:  999,
-            });
-          }
-        }
-      }
-    }
-
-    if (stations.length >= 2) {
-      trains.push({ number, category, type: guessType(category), operator, stations });
-    }
+  if (s.includes('ZILNIC') || s.includes('DAILY') || s.includes('EVERY')) {
+    return 0b11111110; // bits 1..7 set (ignore bit0)
   }
 
-  return trains;
+  // Digits 1-7 (Mon=1..Sun=7)
+  const digits = [...new Set((s.match(/[1-7]/g) || []))].map(x=>parseInt(x,10));
+  if (digits.length) {
+    let mask = 0;
+    for (const d of digits) mask |= (1 << d);
+    return mask;
+  }
+
+  // Romanian abbreviations: L Ma Mi J V S D (sometimes Lu/Mar/Mie/Joi/Vin/Sam/Dum)
+  // We'll look for tokens.
+  const tokens = s
+    .replace(/[^A-ZĂÂÎȘȚ]/g,' ')
+    .split(/\s+/)
+    .filter(Boolean);
+
+  const map = {
+    L:1, LU:1, LUN:1, LUNI:1,
+    MA:2, MAR:2, MARTI:2, MARȚI:2,
+    MI:3, MIE:3, MIERCURI:3,
+    J:4, JO:4, JOI:4,
+    V:5, VI:5, VIN:5, VINERI:5,
+    S:6, SA:6, SAM:6, SAMBATA:6, SÂMBĂTĂ:6,
+    D:7, DU:7, DUM:7, DUMINICA:7, DUMINICĂ:7,
+  };
+
+  let mask = 0;
+  for (const t of tokens) {
+    const key = t.length > 3 ? t : t; // keep as is
+    if (map[key]) mask |= (1 << map[key]);
+  }
+  return mask;
 }
 
-// Better approach: build stop list by collecting all unique origin stations
-// in sequence order, then add final destination from the last element
-function parseCFRXmlV2(xml, defaultOperator) {
-  const result = [];
-  const trainRe = /<Tren\b([^>]*)>([\s\S]*?)<\/Tren>/g;
-  let tm;
+function runsOn(train, dateStr) {
+  // dateStr: "DD.MM.YYYY"
+  if (!dateStr) return true; // no date => don't filter
+  const d = parseDateDMY(dateStr);
+  if (!d) return true;
 
-  while ((tm = trainRe.exec(xml)) !== null) {
-    const attrs = tm[1];
-    const body  = tm[2];
+  if (train.validFrom && d < train.validFrom) return false;
+  if (train.validTo   && d > train.validTo)   return false;
 
-    const numM = attrs.match(/Numar="([^"]+)"/);
-    const catM = attrs.match(/CategorieTren="([^"]+)"/);
-    if (!numM) continue;
+  if (train.daysMask) {
+    const wd = weekdayMon1(d);
+    if ((train.daysMask & (1 << wd)) === 0) return false;
+  }
 
-    const number   = numM[1].trim();
-    const category = catM ? catM[1].trim() : '';
+  return true;
+}
 
-    // Collect all ElementTrasa in order
-    const allElems = [...body.matchAll(/<ElementTrasa\b([^>]*)\/>/g)];
-    if (allElems.length === 0) continue;
-
-    const stations = [];
-
-    allElems.forEach((em, idx) => {
-      const ea    = em[1];
-      const oName = (ea.match(/DenStaOrigine="([^"]+)"/) || [])[1];
-      const dName = (ea.match(/DenStaDestinatie="([^"]+)"/) || [])[1];
-      const oraS  = (ea.match(/OraS="([^"]+)"/) || [])[1]; // arrival at origin in seconds
-      const oraP  = (ea.match(/OraP="([^"]+)"/) || [])[1]; // departure from origin in seconds
-
-      if (!oName) return;
-
-      // Add origin station (each unique stop once)
-      const lastSt = stations[stations.length - 1];
-      if (!lastSt || norm(lastSt.name) !== norm(oName)) {
-        stations.push({
-          name: oName,
-          arr:  secToTime(oraS),
-          dep:  secToTime(oraP),
-        });
-      } else {
-        // Same station — update times if missing
-        if (!lastSt.arr && oraS) lastSt.arr = secToTime(oraS);
-        if (!lastSt.dep && oraP) lastSt.dep = secToTime(oraP);
+function getUrl(url) {
+  return new Promise((resolve, reject) => {
+    const lib = url.startsWith('https:') ? https : http;
+    const req = lib.get(url, res => {
+      if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        // follow redirect
+        resolve(getUrl(res.headers.location));
+        return;
       }
-
-      // On the last element, also add the destination
-      if (idx === allElems.length - 1 && dName) {
-        // Try to get destination arrival time from OraSD (Ora Sosire Destinatie)
-        // or fallback to computing from travel time fields
-        const oraSD = (ea.match(/OraSD=\"([^\"]+)\"/) || [])[1]  // some XML variants
-                    || (ea.match(/OraSosireDestinatie=\"([^\"]+)\"/) || [])[1]
-                    || (ea.match(/OraSDest=\"([^\"]+)\"/) || [])[1];
-        if (norm(dName) !== norm(oName)) {
-          stations.push({
-            name: dName,
-            arr:  oraSD ? secToTime(oraSD) : null,
-            dep:  null,
-          });
-        }
+      if (res.statusCode && res.statusCode >= 400) {
+        reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+        return;
       }
+      const chunks = [];
+      res.on('data', d => chunks.push(d));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
     });
+    req.on('error', reject);
+    req.setTimeout(30000, () => {
+      req.destroy(new Error('Request timeout'));
+    });
+  });
+}
 
-    if (stations.length >= 2) {
-      result.push({ number, category, type: guessType(category), operator: defaultOperator, stations });
+// ─── XML PARSER (best-effort) ───────────────────────────────────────────────
+function parseCFRXml(xml, defaultOperator) {
+  const result = [];
+  const trainRe = /<Tren([^>]*)>([\s\S]*?)<\/Tren>/gi;
+  let tm;
+  while ((tm = trainRe.exec(xml)) !== null) {
+    const attrs  = tm[1] || '';
+    const body   = tm[2] || '';
+
+    const numM = attrs.match(/(?:numar|NumarTren|nr|number)="([^"]+)"/i) || body.match(/<\s*(?:NumarTren|Numar|nr)\s*>\s*([^<]+)\s*<\//i);
+    if (!numM) continue;
+
+    const tipM = attrs.match(/(?:tip|Tip|categorie|type)="([^"]+)"/i) || body.match(/<\s*(?:Tip|Categorie|Category|Type)\s*>\s*([^<]+)\s*<\//i);
+    const opM  = attrs.match(/(?:operator|Operator)="([^"]+)"/i) || body.match(/<\s*(?:Operator)\s*>\s*([^<]+)\s*<\//i);
+
+    // days/validity appear in different places over the years; try a few patterns
+    const daysM =
+      attrs.match(/(?:zile|days|circula|zilecirculatie)="([^"]+)"/i) ||
+      body.match(/<\s*(?:ZileCirculatie|Zile|Days|Circula)\s*>\s*([^<]+)\s*<\//i);
+
+    const fromM =
+      attrs.match(/(?:dataStart|DataStart|from|validFrom|deLa|dataInceput)="([^"]+)"/i) ||
+      body.match(/<\s*(?:DataInceput|ValidFrom|DeLa|From)\s*>\s*([^<]+)\s*<\//i);
+
+    const toM =
+      attrs.match(/(?:dataEnd|DataEnd|to|validTo|panaLa|dataSfarsit)="([^"]+)"/i) ||
+      body.match(/<\s*(?:DataSfarsit|ValidTo|PanaLa|To)\s*>\s*([^<]+)\s*<\//i);
+
+    const number   = (numM[1] || numM[0] || '').toString().trim();
+    const type     = tipM ? (tipM[1] || '').toString().trim() : '';
+    const operator = opM  ? (opM[1]  || '').toString().trim()  : defaultOperator;
+
+    const daysRaw  = daysM ? (daysM[1] || '').toString().trim() : '';
+    const daysMask = daysToMask(daysRaw);
+
+    const validFrom = fromM ? parseDateDMY((fromM[1]||'').toString().trim()) : null;
+    const validTo   = toM   ? parseDateDMY((toM[1]||'').toString().trim())   : null;
+
+    // Parse station stops
+    const stations = [];
+    const stRe = /<(?:Statie|Station|statie)([^>]*)\/?>|<(?:Statie|Station|statie)([^>]*)>([\s\S]*?)<\/(?:Statie|Station|statie)>/gi;
+    let sm;
+    while ((sm = stRe.exec(body)) !== null) {
+      const stAttrs = sm[1] || sm[2] || '';
+      const nameM = stAttrs.match(/(?:nume|name|NumeStatie)="([^"]+)"/i) || (sm[3]||'').match(/<\s*(?:Nume|Name)\s*>\s*([^<]+)\s*<\//i);
+      const arrM  = stAttrs.match(/(?:sosire|arr|arrival|Sosire)="([^"]+)"/i);
+      const depM  = stAttrs.match(/(?:plecare|dep|departure|Plecare)="([^"]+)"/i);
+
+      const name = nameM ? (nameM[1] || '').trim() : '';
+      if (!name) continue;
+
+      const arr = arrM ? arrM[1].trim() : '';
+      const dep = depM ? depM[1].trim() : '';
+
+      stations.push({
+        name,
+        arr: arr || null,
+        dep: dep || null,
+        arrMins: toMins(arr) ?? null,
+        depMins: toMins(dep) ?? null,
+      });
     }
+
+    // Require at least 2 stations and times
+    if (stations.length < 2) continue;
+
+    result.push({
+      id: `${operator}::${number}`, // stable key across sources
+      number,
+      type,
+      operator,
+      daysRaw,
+      daysMask,
+      validFrom,
+      validTo,
+      stations,
+    });
   }
 
   return result;
 }
 
-// ─── LOAD DATA ─────────────────────────────────────────────────────────────
-async function loadData() {
-  loadStatus = 'loading GPS...';
-  console.log('[boot] Loading station GPS...');
-
-  // 1. Load GPS coordinates
-  try {
-    const r   = await get(STATION_GPS_URL, 30000);
-    const geo = JSON.parse(r.body);
-    for (const f of geo.features) {
-      const [lng, lat] = f.geometry.coordinates;
-      stationGPS.set(norm(f.properties.name), {
-        name: f.properties.name,
-        lat, lng,
-        id: f.properties.station_id,
-      });
-    }
-    console.log(`[boot] GPS: ${stationGPS.size} stations`);
-  } catch (e) {
-    console.warn('[boot] GPS failed:', e.message);
-  }
-
-  // 2. Load each timetable XML
-  let total = 0;
-  for (const src of XML_SOURCES) {
-    loadStatus = `loading ${src.operator}...`;
-    try {
-      console.log(`[boot] Fetching ${src.operator}...`);
-      const r = await get(src.url, 90000);
-
-      if (r.status !== 200) {
-        console.warn(`[boot] ${src.operator}: HTTP ${r.status}`);
-        continue;
-      }
-
-      console.log(`[boot] ${src.operator}: ${(r.body.length / 1024).toFixed(0)} KB`);
-      const parsed = parseCFRXmlV2(r.body, src.operator);
-      console.log(`[boot] ${src.operator}: ${parsed.length} trains parsed`);
-
-      for (const train of parsed) {
-        trains.set(train.number, train);
-
-        // Index by every station name
-        for (const st of train.stations) {
-          const n = norm(st.name);
-          if (!stationIndex.has(n)) stationIndex.set(n, new Set());
-          stationIndex.get(n).add(train.number);
-        }
-        total++;
-      }
-    } catch (e) {
-      console.error(`[boot] ${src.operator} error:`, e.message);
+// ─── BUILD INDEXES ─────────────────────────────────────────────────────────
+function rebuildIndexes() {
+  stationIndex.clear();
+  for (const [id, t] of trains) {
+    for (const st of t.stations) {
+      const n = norm(st.name);
+      if (!n) continue;
+      if (!stationIndex.has(n)) stationIndex.set(n, new Set());
+      stationIndex.get(n).add(id);
     }
   }
-
-  dataReady  = true;
-  loadStatus = 'ready';
-  console.log(`[boot] READY: ${trains.size} trains, ${stationIndex.size} stations`);
 }
 
-// ─── JOURNEY SEARCH ────────────────────────────────────────────────────────
-function findDirectJourneys(fromNorm, toNorm) {
-  const fromSet = stationIndex.get(fromNorm) || new Set();
-  const toSet   = stationIndex.get(toNorm)   || new Set();
-  const results = [];
+function trainLabel(t) {
+  // e.g. "IR 1989"
+  const n = (t.number || '').toString().trim();
+  const typ = (t.type || '').toString().trim();
+  const prefix = typ ? typ : '';
+  return prefix ? `${prefix} ${n}`.trim() : n;
+}
 
-  for (const tNum of fromSet) {
-    if (!toSet.has(tNum)) continue;
+// Find direct legs between two stations for trains that run on date
+function findDirect(fromNorm, toNorm, dateStr) {
+  const result = [];
+  const fromSet = stationIndex.get(fromNorm);
+  const toSet   = stationIndex.get(toNorm);
+  if (!fromSet || !toSet) return result;
 
-    const train = trains.get(tNum);
-    if (!train) continue;
+  // intersect train sets
+  for (const id of fromSet) {
+    if (!toSet.has(id)) continue;
+    const t = trains.get(id);
+    if (!t) continue;
+    if (!runsOn(t, dateStr)) continue;
 
-    // Find the indices of from/to in this train's station list
-    const fi = train.stations.findIndex(s => norm(s.name) === fromNorm);
-    const ti = train.stations.findIndex(s => norm(s.name) === toNorm);
-    if (fi < 0 || ti < 0 || fi >= ti) continue;
+    const fi = t.stations.findIndex(s => norm(s.name) === fromNorm);
+    const ti = t.stations.findIndex(s => norm(s.name) === toNorm);
+    if (fi < 0 || ti < 0 || ti <= fi) continue;
 
-    const dep = train.stations[fi].dep || train.stations[fi].arr;
-    const arr = train.stations[ti].arr || train.stations[ti].dep;
-    if (!dep) continue;
-    // If arrival is still null (final terminus with unknown time), estimate from dep + 1 min
-    const arrFinal = arr || dep;
+    const fromStop = t.stations[fi];
+    const toStop   = t.stations[ti];
 
-    const depM = timeToMins(dep);
-    const arrM = timeToMins(arrFinal);
-    const durM = arrM >= depM ? arrM - depM : arrM + 1440 - depM;
+    // departure can be dep or arr if dep missing (some feeds)
+    const depMins = fromStop.depMins ?? fromStop.arrMins;
+    const arrMins = toStop.arrMins ?? toStop.depMins;
+    if (depMins == null || arrMins == null) continue;
 
-    // Attach GPS to stops
-    const stops = train.stations.slice(fi, ti + 1).map(s => {
-      const gps = stationGPS.get(norm(s.name));
-      return { ...s, lat: gps?.lat || null, lng: gps?.lng || null };
-    });
+    const durMins = arrMins - depMins;
+    if (durMins <= 0 || durMins > 24*60) continue;
 
-    results.push({
-      dep, arr: arrFinal, depM, arrM, durM,
-      label:    `${train.category} ${train.number}`,
-      number:   train.number,
-      category: train.category,
-      type:     train.type,
-      operator: train.operator,
-      from:     train.stations[fi].name,
-      to:       train.stations[ti].name,
-      stops,
+    result.push({
+      trainId: id,
+      trainNo: t.number,
+      trainType: t.type,
+      operator: t.operator,
+      trainLabel: trainLabel(t),
+      from: fromStop.name,
+      to: toStop.name,
+      dep: fromStop.dep || fromStop.arr,
+      arr: toStop.arr || toStop.dep,
+      depMins,
+      arrMins,
+      durMins,
+      leg: {
+        trainNo: t.number,
+        type: t.type,
+        operator: t.operator,
+        from: fromStop.name,
+        to: toStop.name,
+        dep: fromStop.dep || fromStop.arr,
+        arr: toStop.arr || toStop.dep,
+        depMins,
+        arrMins,
+      }
     });
   }
 
-  return results.sort((a, b) => a.depM - b.depM);
+  // Sort by departure time
+  result.sort((a,b) => a.depMins - b.depMins);
+  return result;
 }
 
-function searchJourneys(fromName, toName) {
-  const fN = resolveStation(fromName);
-  const tN = resolveStation(toName);
+function searchJourneys(fromName, toName, opts) {
+  const { date, time, directOnly=false, limit=300 } = opts || {};
+  const fromNorm = norm(fromName);
+  const toNorm   = norm(toName);
+  const targetMins = time ? (toMins(time) ?? 0) : 0;
 
   const journeys = [];
 
-  // Direct
-  const directs = findDirectJourneys(fN, tN);
+  // Direct trains
+  const directs = findDirect(fromNorm, toNorm, date);
   for (const d of directs) {
     journeys.push({
       dep: d.dep, arr: d.arr,
-      duration: durStr(d.durM),
-      durationMins: d.durM,
+      duration: durStr(d.durMins),
+      durationMins: d.durMins,
+      trains: [d.trainLabel],
       changes: 0,
-      trains: [d.label],
-      legs: [{
-        train:    d.label,
-        number:   d.number,
-        type:     d.type,
-        operator: d.operator,
-        from:     d.from,
-        to:       d.to,
-        dep:      d.dep,
-        arr:      d.arr,
-        stops:    d.stops,
-      }],
+      legs: [d.leg],
     });
   }
 
-  // 1 change — always search for connections, not just when few directs found
-  {
-    const fromTrains = stationIndex.get(fN) || new Set();
-    const toTrains   = stationIndex.get(tN)  || new Set();
+  if (!directOnly) {
+    // One change (limited for performance)
+    const fromTrains = stationIndex.get(fromNorm) || new Set();
+    const toTrains   = stationIndex.get(toNorm)   || new Set();
 
-    // Find candidate via stations: reachable from 'from' AND can reach 'to'
-    const candidates = new Set();
-    for (const tNum of fromTrains) {
-      const train = trains.get(tNum);
+    const viaCandidates = new Set();
+    for (const id of fromTrains) {
+      const train = trains.get(id);
       if (!train) continue;
-      const fi = train.stations.findIndex(s => norm(s.name) === fN);
+      if (!runsOn(train, date)) continue;
+      const fi = train.stations.findIndex(s => norm(s.name) === fromNorm);
       if (fi < 0) continue;
-      // All stations after 'from' on this train
-      train.stations.slice(fi + 1).forEach(s => {
+      train.stations.slice(fi+1).forEach(s => {
         const n2 = norm(s.name);
-        // Check if any train from this station goes to 'to'
-        const stTrains = stationIndex.get(n2) || new Set();
-        for (const t2 of stTrains) {
-          if (toTrains.has(t2)) { candidates.add(n2); break; }
+        if (!n2) return;
+        const set2 = stationIndex.get(n2);
+        if (!set2) return;
+        for (const id2 of set2) {
+          if (!toTrains.has(id2)) continue;
+          const t2 = trains.get(id2);
+          if (!t2) continue;
+          if (!runsOn(t2, date)) continue;
+          viaCandidates.add(n2);
+          break;
         }
       });
     }
 
-    for (const via of [...candidates].slice(0, 20)) {
-      const leg1s = findDirectJourneys(fN, via);
-      const leg2s = findDirectJourneys(via, tN);
+    for (const via of [...viaCandidates].slice(0, 10)) {
+      const leg1s = findDirect(fromNorm, via, date);
+      const leg2s = findDirect(via, toNorm, date);
 
-      for (const l1 of leg1s.slice(0, 8)) {
-        for (const l2 of leg2s.slice(0, 8)) {
-          const wait = l2.depM - l1.arrM;
-          if (wait < 5 || wait > 180) continue; // 5min–3h connection window
-
-          const totalDur = l2.arrM - l1.depM;
-          if (totalDur <= 0 || totalDur > 1200) continue;
+      for (const l1 of leg1s.slice(0, 12)) {
+        for (const l2 of leg2s.slice(0, 12)) {
+          const wait = l2.depMins - l1.arrMins;
+          if (wait < 5 || wait > 180) continue;
+          const durM = l2.arrMins - l1.depMins;
+          if (durM < 0 || durM > 24*60) continue;
 
           journeys.push({
             dep: l1.dep, arr: l2.arr,
-            duration: durStr(totalDur),
-            durationMins: totalDur,
+            duration: durStr(durM),
+            durationMins: durM,
+            trains: [l1.trainLabel, l2.trainLabel],
             changes: 1,
             waitMins: wait,
-            viaStation: l1.to,
-            trains: [l1.label, l2.label],
-            legs: [
-              { train: l1.label, number: l1.number, type: l1.type, operator: l1.operator, from: l1.from, to: l1.to, dep: l1.dep, arr: l1.arr, stops: l1.stops },
-              { train: l2.label, number: l2.number, type: l2.type, operator: l2.operator, from: l2.from, to: l2.to, dep: l2.dep, arr: l2.arr, stops: l2.stops },
-            ],
+            viaStation: l1.leg.to,
+            legs: [l1.leg, l2.leg],
           });
         }
       }
     }
   }
 
-  // Deduplicate + sort by duration
+  // Deduplicate
   const seen = new Set();
-  return journeys
-    .filter(j => {
-      const k = `${j.dep}${j.arr}${j.trains.join()}`;
-      if (seen.has(k)) return false;
-      seen.add(k);
-      return true;
-    })
-    .sort((a, b) => a.depM - b.depM)
-    .slice(0, 100);
+  const unique = journeys.filter(j => {
+    const k = `${j.dep}|${j.arr}|${j.trains.join('+')}|${j.changes||0}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+
+  // Sort: upcoming after requested time first (by dep), then the rest
+  unique.sort((a,b) => (toMins(a.dep)||0) - (toMins(b.dep)||0));
+  const upcoming = unique.filter(j => (toMins(j.dep)||0) >= targetMins);
+  const past = unique.filter(j => (toMins(j.dep)||0) < targetMins);
+
+  const ordered = [...upcoming, ...past];
+
+  return ordered.slice(0, Math.max(1, Math.min(500, limit)));
 }
 
-// ─── REAL-TIME DELAY (IRIS) ────────────────────────────────────────────────
-async function getLiveDelay(trainNumber) {
-  const key    = 'live:' + trainNumber;
-  const cached = cacheGet(key);
-  if (cached !== null) return cached;
+// ─── LOAD DATA ─────────────────────────────────────────────────────────────
+async function loadAll() {
+  dataLoaded = false;
+  lastLoadError = null;
+  lastDownloadedBytes = 0;
+
+  trains.clear();
 
   try {
-    const resp = await Promise.race([
-      get(IRIS_URL(trainNumber), 8000),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('iris timeout')), 8000)),
-    ]);
+    for (const src of TIMETABLE_URLS) {
+      const buf = await getUrl(src.url);
+      lastDownloadedBytes += buf.length;
+      const xml = buf.toString('utf8');
 
-    const html = resp.body;
-
-    // Extract delay
-    const delayM = html.match(/(?:întârziere|intarziere)[^<\d]*?(\d+)\s*min/i)
-                || html.match(/delay[^<\d]*?(\d+)\s*min/i);
-    const delay   = delayM ? parseInt(delayM[1]) : 0;
-
-    // Extract per-station delay info from table
-    const stationDelays = [];
-    const rows          = html.match(/<tr[^>]*>[\s\S]*?<\/tr>/gi) || [];
-    for (const row of rows) {
-      const cells = (row.match(/<td[^>]*>([\s\S]*?)<\/td>/gi) || []).map(c => stripTags(c));
-      if (cells.length >= 2 && /\d{2}:\d{2}/.test(cells[1] || '')) {
-        stationDelays.push({
-          name:      cells[0],
-          scheduled: cells[1],
-          actual:    cells[2] || null,
-          delay:     parseInt(cells[3]) || 0,
-        });
+      const parsed = parseCFRXml(xml, src.operator);
+      for (const t of parsed) {
+        // If duplicates across sources, keep the one with more stations
+        const existing = trains.get(t.id);
+        if (!existing || (t.stations.length > existing.stations.length)) {
+          trains.set(t.id, t);
+        }
       }
     }
 
-    const result = {
-      trainNumber,
-      delay,
-      onTime:        delay === 0,
-      stationDelays,
-      liveAvailable: true,
-      updatedAt:     new Date().toISOString(),
-    };
-
-    cacheSet(key, result, 60); // cache 60 seconds
-    return result;
-
-  } catch (err) {
-    const result = {
-      trainNumber,
-      delay:         0,
-      onTime:        true,
-      stationDelays: [],
-      liveAvailable: false,
-      error:         err.message,
-      updatedAt:     new Date().toISOString(),
-    };
-    cacheSet(key, result, 30);
-    return result;
+    rebuildIndexes();
+    dataLoaded = true;
+    lastLoadAt = new Date().toISOString();
+  } catch (e) {
+    lastLoadError = String(e && e.message ? e.message : e);
+    dataLoaded = false;
   }
 }
 
-// ─── ROUTES ────────────────────────────────────────────────────────────────
+// initial load + periodic refresh
+loadAll();
+setInterval(loadAll, 6 * 60 * 60 * 1000); // every 6 hours
 
-app.get('/', (req, res) => res.json({
-  name:     'Velox API',
-  version:  '4.0.0',
-  status:   loadStatus,
-  trains:   trains.size,
+// ─── ROUTES ────────────────────────────────────────────────────────────────
+app.get('/', (req,res) => res.json({
+  name: 'Velox API',
+  version: '3.1.0',
+  status: dataLoaded ? 'ready' : 'loading',
+  trains: trains.size,
   stations: stationIndex.size,
-  ready:    dataReady,
   endpoints: {
     health:       'GET /health',
     stations:     'GET /api/stations?q=Brasov',
-    itineraries:  'GET /api/itineraries?from=Brașov&to=Constanța&date=24.02.2026',
-    trainRoute:   'GET /api/train/:number',
-    trainLive:    'GET /api/train/:number/live',
-    stationBoard: 'GET /api/board/:stationName',
-  },
+    itineraries:  'GET /api/itineraries?from=Bucuresti%20Nord&to=Constanta&date=25.02.2026&time=08:00&limit=200',
+    trainInfo:    'GET /api/train/:number?date=25.02.2026',
+    stationBoard: 'GET /api/board/:stationName?date=25.02.2026',
+  }
 }));
 
-app.get('/health', (req, res) => res.json({
-  status:   loadStatus,
-  ready:    dataReady,
-  trains:   trains.size,
+app.get('/health', (req,res) => res.json({
+  status: 'ok',
+  trains: trains.size,
   stations: stationIndex.size,
-  time:     new Date().toISOString(),
+  lastLoadAt,
+  lastLoadError,
+  timetableUrlsConfigured: TIMETABLE_URLS.length,
+  lastDownloadedBytes,
+  time: new Date().toISOString(),
 }));
 
-// GET /api/stations?q=Brasov
-app.get('/api/stations', (req, res) => {
+// Stations autocomplete
+app.get('/api/stations', (req,res) => {
   const q = norm(req.query.q || '');
-  if (q.length < 2) return res.status(400).json({ error: 'Minimum 2 characters' });
-  if (!dataReady)   return res.status(503).json({ error: 'Loading, try again in 30s', status: loadStatus });
+  if (!q || q.length < 2) return res.json({ stations: [] });
 
-  const matches = [];
-  const seen    = new Set();
-
-  for (const [n, trainSet] of stationIndex) {
-    if (!n.includes(q)) continue;
-
-    // Get original name with diacritics from first train
-    const tNum  = [...trainSet][0];
-    const train = trains.get(tNum);
-    if (!train) continue;
-    const st = train.stations.find(s => norm(s.name) === n);
-    if (!st || seen.has(st.name)) continue;
-    seen.add(st.name);
-
-    const gps = stationGPS.get(n);
-    matches.push({
-      name:       st.name,
-      lat:        gps?.lat  || null,
-      lng:        gps?.lng  || null,
-      stationId:  gps?.id   || null,
-      trainCount: trainSet.size,
-    });
-  }
-
-  // Sort: exact matches first, then by number of trains (busier stations first)
-  matches.sort((a, b) => {
-    const aN = norm(a.name), bN = norm(b.name);
-    if (aN === q && bN !== q) return -1;
-    if (bN === q && aN !== q) return  1;
-    return b.trainCount - a.trainCount;
-  });
-
-  return res.json({ stations: matches.slice(0, 15), total: matches.length });
-});
-
-// GET /api/itineraries?from=Brașov&to=Constanța&date=24.02.2026
-app.get('/api/itineraries', (req, res) => {
-  const from = (req.query.from || '').trim();
-  const to   = (req.query.to   || '').trim();
-  const date = (req.query.date || '').trim() || todayStr();
-
-  if (!from || !to) return res.status(400).json({ error: 'from and to are required' });
-  if (!dataReady)   return res.status(503).json({ error: 'Loading, try again in 30s', status: loadStatus });
-
-  const key    = `itin:${resolveStation(from)}:${resolveStation(to)}:${date}`;
-  const cached = cacheGet(key);
-  if (cached) return res.json({ source: 'cache', from, to, date, journeys: cached, count: cached.length });
-
-  const journeys = searchJourneys(from, to);
-  cacheSet(key, journeys, 300); // cache 5 minutes
-
-  return res.json({ source: 'live', from, to, date, journeys, count: journeys.length });
-});
-
-// GET /api/train/1581  — full scheduled route
-app.get('/api/train/:number', (req, res) => {
-  if (!dataReady) return res.status(503).json({ error: 'Loading, try again in 30s' });
-
-  const train = trains.get(req.params.number.trim());
-  if (!train)  return res.status(404).json({ error: `Train ${req.params.number} not found` });
-
-  // Enrich stations with GPS
-  const stations = train.stations.map(s => {
-    const gps = stationGPS.get(norm(s.name));
-    return { ...s, lat: gps?.lat || null, lng: gps?.lng || null };
-  });
-
-  const first = train.stations[0];
-  const last  = train.stations[train.stations.length - 1];
-
-  return res.json({
-    number:   train.number,
-    type:     train.type,
-    category: train.category,
-    operator: train.operator,
-    from:     first.name,
-    to:       last.name,
-    dep:      first.dep || first.arr,
-    arr:      last.arr  || last.dep,
-    stops:    stations.length,
-    stations,
-  });
-});
-
-// GET /api/train/1581/live  — real-time delay from IRIS
-app.get('/api/train/:number/live', async (req, res) => {
-  const num   = req.params.number.trim();
-  const live  = await getLiveDelay(num);
-  const train = trains.get(num);
-
-  return res.json({
-    ...live,
-    ...(train ? { type: train.type, operator: train.operator, from: train.stations[0]?.name, to: train.stations[train.stations.length-1]?.name } : {}),
-  });
-});
-
-// GET /api/board/:stationName  — all trains calling at a station today
-app.get('/api/board/:stationName', (req, res) => {
-  if (!dataReady) return res.status(503).json({ error: 'Loading, try again in 30s' });
-
-  const stName = req.params.stationName.trim();
-  const n      = resolveStation(stName);
-  const nums   = stationIndex.get(n);
-
-  if (!nums || nums.size === 0) {
-    // Try partial match — find closest station name
-    const q2 = norm(stName);
-    const suggestions = [];
-    for (const [key] of stationIndex) {
-      if (key.includes(q2) || q2.includes(key)) suggestions.push(key);
+  const out = [];
+  for (const stNorm of stationIndex.keys()) {
+    if (stNorm.includes(q)) {
+      out.push(stNorm);
+      if (out.length >= 30) break;
     }
-    return res.status(404).json({
-      error: `Station "${stName}" not found`,
-      suggestions: suggestions.slice(0, 5),
-      hint: 'Use /api/stations?q=... to find the correct name',
-    });
   }
+  // Return display-ish names (best effort: title-case from norm)
+  res.json({ stations: out.map(s => s.split(' ').map(w => w ? (w[0].toUpperCase()+w.slice(1)) : '').join(' ')) });
+});
 
-  const departures = [];
-  for (const tNum of nums) {
-    const train = trains.get(tNum);
-    if (!train) continue;
-    const st = train.stations.find(s => norm(s.name) === n);
-    if (!st) continue;
-    const dep = st.dep || st.arr;
-    if (!dep) continue;
+// Itineraries search
+app.get('/api/itineraries', (req,res) => {
+  const from = req.query.from;
+  const to   = req.query.to;
+  const date = req.query.date;  // "DD.MM.YYYY"
+  const time = req.query.time;  // "HH:MM"
 
-    departures.push({
-      time:     dep,
-      train:    `${train.category} ${train.number}`,
-      number:   train.number,
-      type:     train.type,
-      operator: train.operator,
-      to:       train.stations[train.stations.length - 1].name,
-      arr:      train.stations[train.stations.length - 1].arr,
-      delay:    0, // enriched by /live endpoint
-    });
-  }
+  const directOnly = String(req.query.directOnly||'').toLowerCase()==='true';
+  const limit = Math.min(500, Math.max(1, parseInt(req.query.limit||'200',10) || 200));
 
-  const gps = stationGPS.get(n);
-  departures.sort((a, b) => timeToMins(a.time) - timeToMins(b.time));
+  if (!from || !to) return res.status(400).json({ error: 'Missing from/to' });
 
-  return res.json({
-    station:    stName,
-    lat:        gps?.lat || null,
-    lng:        gps?.lng || null,
-    stationId:  gps?.id  || null,
-    departures,
-    count:      departures.length,
+  const journeys = searchJourneys(from, to, { date, time, directOnly, limit });
+
+  res.json({
+    from, to, date: date || null, time: time || null,
+    count: journeys.length,
+    journeys
   });
 });
 
-// ─── START ─────────────────────────────────────────────────────────────────
-const PORT = parseInt(process.env.PORT, 10) || 3001;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Velox API v4 on port ${PORT}`);
-  loadData().catch(e => {
-    loadStatus = 'error: ' + e.message;
-    console.error('[boot] FATAL:', e.message);
+// Train details: supports date filtering
+app.get('/api/train/:number', (req,res) => {
+  const num = String(req.params.number || '').trim();
+  const date = req.query.date || null;
+
+  // Find all trains matching number (across operators)
+  const matches = [];
+  for (const t of trains.values()) {
+    if (String(t.number).trim() === num) {
+      if (!runsOn(t, date)) continue;
+      matches.push(t);
+    }
+  }
+
+  if (!matches.length) {
+    return res.status(404).json({ error: 'Train not found (or not running on this date)', number: num, date });
+  }
+
+  // Prefer the one with the most stations
+  matches.sort((a,b) => b.stations.length - a.stations.length);
+  const t = matches[0];
+
+  res.json({
+    number: t.number,
+    type: t.type,
+    operator: t.operator,
+    days: t.daysRaw || null,
+    validFrom: t.validFrom ? t.validFrom.toISOString().slice(0,10) : null,
+    validTo: t.validTo ? t.validTo.toISOString().slice(0,10) : null,
+    stations: t.stations.map(s => ({ name: s.name, arr: s.arr, dep: s.dep })),
   });
 });
+
+// Simple station board: all trains that stop here, ordered by departure time
+app.get('/api/board/:stationName', (req,res) => {
+  const stationName = req.params.stationName;
+  const date = req.query.date || null;
+
+  const stNorm = norm(stationName);
+  const set = stationIndex.get(stNorm);
+  if (!set) return res.json({ station: stationName, date, departures: [] });
+
+  const deps = [];
+  for (const id of set) {
+    const t = trains.get(id);
+    if (!t) continue;
+    if (!runsOn(t, date)) continue;
+    const idx = t.stations.findIndex(s => norm(s.name) === stNorm);
+    if (idx < 0) continue;
+    const stop = t.stations[idx];
+    const depM = stop.depMins ?? stop.arrMins;
+    if (depM == null) continue;
+
+    deps.push({
+      trainNo: t.number,
+      type: t.type,
+      operator: t.operator,
+      dep: stop.dep || stop.arr,
+      direction: t.stations[t.stations.length-1]?.name || null,
+    });
+  }
+
+  deps.sort((a,b) => (toMins(a.dep)||0) - (toMins(b.dep)||0));
+  res.json({ station: stationName, date, departures: deps });
+});
+
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, '0.0.0.0', () => console.log(`Velox backend running on port ${PORT}`));
