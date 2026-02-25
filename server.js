@@ -182,6 +182,41 @@ async function getIRISStationBoard(stationName) {
   }
 }
 
+// ─── INFOFER VALID TRAINS SCRAPER ─────────────────────────────────────────
+// Fetches the official list of trains running on a given date from InfoFer.
+// URL: https://mersultrenurilor.infofer.ro/ro-RO/Trains?Date=DD.MM.YYYY
+// Returns a Set of train number strings, or null if fetch fails.
+
+const _validTrainsCache = {}; // date -> { ts, nums: Set }
+
+async function getValidTrainsForDate(dateStr) {
+  // Check in-memory cache (valid for 6 hours)
+  const cached = _validTrainsCache[dateStr];
+  if (cached && Date.now() - cached.ts < 6 * 3600 * 1000) return cached.nums;
+
+  const url = `https://mersultrenurilor.infofer.ro/ro-RO/Trains?Date=${encodeURIComponent(dateStr)}`;
+  try {
+    const r = await get(url, 15000);
+    const html = r.body || '';
+    // Extract all train numbers from href="/ro-RO/Tren/XXXX" patterns
+    const nums = new Set();
+    const re = /\/ro-RO\/Tren\/(\d+)/g;
+    let m;
+    while ((m = re.exec(html)) !== null) nums.add(m[1]);
+
+    if (nums.size > 0) {
+      console.log(`[InfoFer] Valid trains for ${dateStr}: ${nums.size} trains`);
+      _validTrainsCache[dateStr] = { ts: Date.now(), nums };
+      return nums;
+    }
+    console.log(`[InfoFer] No trains found in page for ${dateStr} (len=${html.length})`);
+    return null;
+  } catch (e) {
+    console.error(`[InfoFer] Failed to fetch train list for ${dateStr}: ${e.message}`);
+    return null;
+  }
+}
+
 // ─── HELPERS ───────────────────────────────────────────────────────────────
 
 // Convert seconds-since-midnight to HH:MM
@@ -609,6 +644,12 @@ async function loadData() {
   dataReady  = true;
   loadStatus = 'ready';
   console.log(`[boot] READY: ${trains.size} trains, ${stationIndex.size} stations`);
+
+  // Pre-warm InfoFer valid trains list for today at boot
+  getValidTrainsForDate(todayStr()).then(nums => {
+    if (nums) console.log(`[boot] InfoFer confirmed ${nums.size} trains running today`);
+    else console.log(`[boot] WARNING: InfoFer unavailable — ghost filtering degraded`);
+  });
 }
 
 // ─── JOURNEY SEARCH ────────────────────────────────────────────────────────
@@ -1121,38 +1162,45 @@ async function checkTrainOnInfoFer(trainNum, dateStr) {
   }
 }
 
-// Validate a list of train numbers for a date.
-// Returns an object { trainNum: true/false }
-// Uses XML schedule first, falls back to InfoFer for trains with no schedule data.
+// Validate a list of train numbers for a given date.
+// PRIMARY: uses the InfoFer /Trains?Date=... page — the definitive list of trains running that day.
+// FALLBACK: XML schedule (ZileSaptamana) + per-train IRIS check.
 async function validateTrains(trainNumbers, dateStr) {
+  if (!trainNumbers.length) return {};
+
+  // ── Primary: InfoFer Trains page (single HTTP call for all trains at once) ──
+  const validSet = await getValidTrainsForDate(dateStr);
+  if (validSet && validSet.size > 0) {
+    const results = {};
+    for (const num of trainNumbers) {
+      results[num] = validSet.has(num);
+      if (!results[num]) console.log(`[validate] ${num} GHOST — not in InfoFer list for ${dateStr}`);
+    }
+    return results;
+  }
+
+  // ── Fallback: XML schedule check + per-train IRIS check ──
+  console.log(`[validate] InfoFer page unavailable for ${dateStr}, falling back to XML+IRIS`);
   const results = {};
-  const needsInfoFer = [];
+  const needsIris = [];
 
   for (const num of trainNumbers) {
     const train = trains.get(num);
     if (!train) { results[num] = false; continue; }
-
-    // XML schedule check first (instant, no HTTP)
-    if (train.schedule && train.schedule.length > 0) {
-      const xmlSays = trainRunsOnDate(train, dateStr);
-      if (!xmlSays) {
-        console.log(`[validate] ${num} BLOCKED by XML schedule for ${dateStr}`);
-        results[num] = false;
-        continue;
-      }
+    if (train.schedule && train.schedule.length > 0 && !trainRunsOnDate(train, dateStr)) {
+      results[num] = false;
+      console.log(`[validate] ${num} BLOCKED by XML schedule for ${dateStr}`);
+      continue;
     }
-    // Always verify against InfoFer regardless of XML schedule
-    // (XML schedules are often incomplete or wrong)
-    needsInfoFer.push(num);
+    needsIris.push(num);
   }
 
-  // Check InfoFer in parallel batches of 5
-  for (let i = 0; i < needsInfoFer.length; i += 5) {
-    const batch = needsInfoFer.slice(i, i + 5);
+  // Check IRIS in batches of 5
+  for (let i = 0; i < needsIris.length; i += 5) {
+    const batch = needsIris.slice(i, i + 5);
     await Promise.all(batch.map(async num => {
-      const ok = await checkTrainOnInfoFer(num, dateStr);
-      if (!ok) console.log(`[validate] ${num} BLOCKED by InfoFer for ${dateStr}`);
-      results[num] = ok;
+      results[num] = await checkTrainOnInfoFer(num, dateStr);
+      if (!results[num]) console.log(`[validate] ${num} BLOCKED by IRIS for ${dateStr}`);
     }));
   }
 
@@ -1294,21 +1342,16 @@ app.get('/api/board/:stationName', async (req, res) => {
     });
   }
 
-  // Filter by XML schedule (ZileSaptamana) — eliminates known non-running trains
-  const xmlFiltered = rawDeps.filter(d => {
-    const t = trains.get(d.number);
-    return t ? trainRunsOnDate(t, date) : true;
-  });
-
-  // Validate remainder against InfoFer (network call — may fail open)
-  const allNums = [...new Set(xmlFiltered.map(d => d.number).filter(Boolean))];
+  // Use validateTrains (InfoFer page → XML → IRIS) to filter ghost trains
+  const allNums = [...new Set(rawDeps.map(d => d.number).filter(Boolean))];
   let validNums = new Set(allNums);
   try {
     const validation = await validateTrains(allNums, date);
     validNums = new Set(Object.entries(validation).filter(([,ok])=>ok).map(([n])=>n));
+    console.log(`[board fallback] ${validNums.size}/${allNums.length} trains validated for ${stName}`);
   } catch (e) { console.error('[board fallback] validation error:', e.message); }
 
-  const departures = xmlFiltered.filter(d => !d.number || validNums.has(d.number));
+  const departures = rawDeps.filter(d => !d.number || validNums.has(d.number));
   departures.sort((a, b) => timeToMins(a.time) - timeToMins(b.time));
 
   return res.json({
