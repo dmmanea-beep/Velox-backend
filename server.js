@@ -182,41 +182,6 @@ async function getIRISStationBoard(stationName) {
   }
 }
 
-// ─── INFOFER VALID TRAINS SCRAPER ─────────────────────────────────────────
-// Fetches the official list of trains running on a given date from InfoFer.
-// URL: https://mersultrenurilor.infofer.ro/ro-RO/Trains?Date=DD.MM.YYYY
-// Returns a Set of train number strings, or null if fetch fails.
-
-const _validTrainsCache = {}; // date -> { ts, nums: Set }
-
-async function getValidTrainsForDate(dateStr) {
-  // Check in-memory cache (valid for 6 hours)
-  const cached = _validTrainsCache[dateStr];
-  if (cached && Date.now() - cached.ts < 6 * 3600 * 1000) return cached.nums;
-
-  const url = `https://mersultrenurilor.infofer.ro/ro-RO/Trains?Date=${encodeURIComponent(dateStr)}`;
-  try {
-    const r = await get(url, 15000);
-    const html = r.body || '';
-    // Extract all train numbers from href="/ro-RO/Tren/XXXX" patterns
-    const nums = new Set();
-    const re = /\/ro-RO\/Tren\/(\d+)/g;
-    let m;
-    while ((m = re.exec(html)) !== null) nums.add(m[1]);
-
-    if (nums.size > 0) {
-      console.log(`[InfoFer] Valid trains for ${dateStr}: ${nums.size} trains`);
-      _validTrainsCache[dateStr] = { ts: Date.now(), nums };
-      return nums;
-    }
-    console.log(`[InfoFer] No trains found in page for ${dateStr} (len=${html.length})`);
-    return null;
-  } catch (e) {
-    console.error(`[InfoFer] Failed to fetch train list for ${dateStr}: ${e.message}`);
-    return null;
-  }
-}
-
 // ─── HELPERS ───────────────────────────────────────────────────────────────
 
 // Convert seconds-since-midnight to HH:MM
@@ -645,11 +610,7 @@ async function loadData() {
   loadStatus = 'ready';
   console.log(`[boot] READY: ${trains.size} trains, ${stationIndex.size} stations`);
 
-  // Pre-warm InfoFer valid trains list for today at boot
-  getValidTrainsForDate(todayStr()).then(nums => {
-    if (nums) console.log(`[boot] InfoFer confirmed ${nums.size} trains running today`);
-    else console.log(`[boot] WARNING: InfoFer unavailable — ghost filtering degraded`);
-  });
+
 }
 
 // ─── JOURNEY SEARCH ────────────────────────────────────────────────────────
@@ -1126,82 +1087,83 @@ app.get('/api/itineraries', async (req, res) => {
 // ─── INFOFER TRAIN VALIDATION ─────────────────────────────────────────────
 // Check a single train number against InfoFer mers tren for a specific date.
 // Returns true if running, false if not found / not running on that date.
-// Check if a specific train runs on a specific date using IRIS MersTrenRo.aspx.
-// MersTrenRo.aspx is date-aware: it only shows station times for dates the train runs.
-// If the response has no time data, the train is NOT running that day.
+// Check if a specific train runs on a specific date using IRIS.
+// Fail-open: if IRIS is unreachable or ambiguous, we show the train.
 async function checkTrainOnInfoFer(trainNum, dateStr) {
   const cacheKey = `infofer:${trainNum}:${dateStr}`;
   const cached = cacheGet(cacheKey);
   if (cached !== null) return cached;
 
-  // IRIS MersTrenRo.aspx — pass train number + date in DD.MM.YYYY format
-  // Returns the scheduled route for that specific date.
-  // If the train doesn't run, it returns empty or a very short error page.
   const url = `http://appiris.infofer.ro/MersTrenRo.aspx?tren=${encodeURIComponent(trainNum)}&data=${encodeURIComponent(dateStr)}`;
   try {
-    const r = await get(url, 8000);
+    const r = await get(url, 6000);
     const html = r.body || '';
 
-    // A valid running train's page has time entries like "07:30" in a table
-    const hasTimes = /\d{2}:\d{2}/.test(html) && html.length > 500;
-
-    // Extra check: look for explicit "nu circulă" or "nu există"
-    const explicitNotRunning =
+    // Only block if IRIS explicitly says the train doesn't run
+    const notRunning =
       /nu circul[aă]/i.test(html) ||
-      /nu exist[aă]/i.test(html) ||
-      html.length < 200;
+      /nu exist[aă] informa/i.test(html) ||
+      /tren.*negasit/i.test(html) ||
+      (html.length > 50 && html.length < 300 && !/<table/i.test(html));
 
-    const running = hasTimes && !explicitNotRunning;
-    console.log(`[validate] train ${trainNum} on ${dateStr}: ${running ? 'RUNS' : 'GHOST'} (html=${html.length}b, hasTimes=${hasTimes})`);
+    const running = !notRunning;
     cacheSet(cacheKey, running, 3600);
     return running;
   } catch (e) {
-    console.log(`[validate] train ${trainNum} IRIS error: ${e.message} — fail open`);
+    // Network error → fail open (show train)
     cacheSet(cacheKey, true, 300);
-    return true; // fail open — better to show than to hide valid trains
+    return true;
   }
 }
 
+// Track whether IRIS is reachable (probe result cached 10 min)
+let _irisReachable = null;
+let _irisProbeTime = 0;
+async function isIrisReachable() {
+  if (Date.now() - _irisProbeTime < 600000) return _irisReachable;
+  try {
+    const r = await get('http://appiris.infofer.ro/MersTrenRo.aspx?tren=1581', 4000);
+    _irisReachable = r.status === 200 && r.body.length > 100;
+  } catch (e) {
+    _irisReachable = false;
+  }
+  _irisProbeTime = Date.now();
+  console.log(`[IRIS] reachable: ${_irisReachable}`);
+  return _irisReachable;
+}
+
 // Validate a list of train numbers for a given date.
-// PRIMARY: uses the InfoFer /Trains?Date=... page — the definitive list of trains running that day.
-// FALLBACK: XML schedule (ZileSaptamana) + per-train IRIS check.
+// Step 1: XML schedule filter (instant — ZileSaptamana + date range).
+// Step 2: IRIS per-train check ONLY if IRIS is reachable (skip if not to avoid slow timeouts).
+// Fail-open: trains with no schedule data and no IRIS check are shown.
 async function validateTrains(trainNumbers, dateStr) {
   if (!trainNumbers.length) return {};
-
-  // ── Primary: InfoFer Trains page (single HTTP call for all trains at once) ──
-  const validSet = await getValidTrainsForDate(dateStr);
-  if (validSet && validSet.size > 0) {
-    const results = {};
-    for (const num of trainNumbers) {
-      results[num] = validSet.has(num);
-      if (!results[num]) console.log(`[validate] ${num} GHOST — not in InfoFer list for ${dateStr}`);
-    }
-    return results;
-  }
-
-  // ── Fallback: XML schedule check + per-train IRIS check ──
-  console.log(`[validate] InfoFer page unavailable for ${dateStr}, falling back to XML+IRIS`);
   const results = {};
   const needsIris = [];
 
   for (const num of trainNumbers) {
     const train = trains.get(num);
     if (!train) { results[num] = false; continue; }
+    // XML schedule check — blocks trains outside date range or wrong day of week
     if (train.schedule && train.schedule.length > 0 && !trainRunsOnDate(train, dateStr)) {
       results[num] = false;
-      console.log(`[validate] ${num} BLOCKED by XML schedule for ${dateStr}`);
       continue;
     }
     needsIris.push(num);
   }
 
-  // Check IRIS in batches of 5
-  for (let i = 0; i < needsIris.length; i += 5) {
-    const batch = needsIris.slice(i, i + 5);
-    await Promise.all(batch.map(async num => {
-      results[num] = await checkTrainOnInfoFer(num, dateStr);
-      if (!results[num]) console.log(`[validate] ${num} BLOCKED by IRIS for ${dateStr}`);
-    }));
+  // Only call IRIS if it's known to be reachable (avoids 6s timeouts × 50 trains)
+  const irisOk = await isIrisReachable();
+  if (irisOk) {
+    for (let i = 0; i < needsIris.length; i += 10) {
+      const batch = needsIris.slice(i, i + 10);
+      await Promise.all(batch.map(async num => {
+        results[num] = await checkTrainOnInfoFer(num, dateStr);
+      }));
+    }
+  } else {
+    // IRIS unreachable — fail open for all remaining trains
+    for (const num of needsIris) results[num] = true;
   }
 
   return results;
