@@ -9,32 +9,31 @@ app.use(cors({ origin: '*', methods: ['GET', 'OPTIONS'] }));
 app.options('*', cors());
 
 // ─── DATA SOURCES ──────────────────────────────────────────────────────────
-// All confirmed 2025-2026 XML URLs from data.gov.ro
+// XML files are bundled in /data/ folder in the repo.
+// This avoids depending on data.gov.ro being reachable at boot time.
+// To update: download new XMLs from data.gov.ro and replace files in /data/.
+const path = require('path');
+const fs   = require('fs');
+
 const XML_SOURCES = [
-  {
-    operator: 'CFR Călători',
-    url: 'https://data.gov.ro/dataset/c4f71dbb-de39-49b2-b697-5b60a5f299a2/resource/0f67143e-bb88-4a06-8e7a-b35b1eb91329/download/trenuri-2025-2026_sntfc.xml'
-  },
-  {
-    operator: 'Interregional Călători',
-    url: 'https://data.gov.ro/dataset/b4e2ce0b-6935-44b1-8e9d-f3999123358a/resource/1a083cf5-d37c-4618-aeb8-3f1ba0dd22dc/download/trenuri-2025-2026_interregional-calatori.xml'
-  },
-  {
-    operator: 'Regio Călători',
-    url: 'https://data.gov.ro/dataset/1da1018d-df38-4b5f-9667-88e4521abfb3/resource/771c1e7f-e552-46aa-8a6b-b9276b9b556c/download/trenuri-2025-2026_regio-calatori.xml'
-  },
-  {
-    operator: 'Transferoviar Călători',
-    url: 'https://data.gov.ro/dataset/9d4adc7b-d407-46c2-9003-5aa87cd16fb7/resource/2f1d9f58-1e97-4a4a-bc65-86c52b7db1a9/download/trenuri-2025-2026_transferoviar-calatori.xml'
-  },
-  {
-    operator: 'Astra Trans Carpatic',
-    url: 'https://data.gov.ro/dataset/1d057a43-3eaa-4fed-a349-4106f3ad0e49/resource/aab96a77-0fbe-4770-8408-e7b23c90480d/download/trenuri-2025-2026_astratranscarpatic.xml'
-  },
-  // NOTE: Softrans XML removed — their data.gov.ro file contains wrong train numbers
-  // (shows IR 1683 etc. which are CFR Călători numbers). Softrans real trains are
-  // in the 11xxx range and run Craiova-Brasov-Bucuresti, not Bucuresti-Constanta.
+  { operator: 'CFR Călători',          file: 'cfr.xml' },
+  { operator: 'Interregional Călători', file: 'interregional.xml' },
+  { operator: 'Regio Călători',         file: 'regio.xml' },
+  { operator: 'Transferoviar Călători', file: 'transferoviar.xml' },
+  { operator: 'Astra Trans Carpatic',   file: 'astra.xml' },
+  // Softrans excluded: their XML contains wrong train numbers
 ];
+
+// Remote URLs kept for manual refresh via /api/refresh-xml (admin use)
+const XML_URLS = {
+  'cfr.xml':           'https://data.gov.ro/dataset/c4f71dbb-de39-49b2-b697-5b60a5f299a2/resource/0f67143e-bb88-4a06-8e7a-b35b1eb91329/download/trenuri-2025-2026_sntfc.xml',
+  'interregional.xml': 'https://data.gov.ro/dataset/b4e2ce0b-6935-44b1-8e9d-f3999123358a/resource/1a083cf5-d37c-4618-aeb8-3f1ba0dd22dc/download/trenuri-2025-2026_interregional-calatori.xml',
+  'regio.xml':         'https://data.gov.ro/dataset/1da1018d-df38-4b5f-9667-88e4521abfb3/resource/771c1e7f-e552-46aa-8a6b-b9276b9b556c/download/trenuri-2025-2026_regio-calatori.xml',
+  'transferoviar.xml': 'https://data.gov.ro/dataset/9d4adc7b-d407-46c2-9003-5aa87cd16fb7/resource/2f1d9f58-1e97-4a4a-bc65-86c52b7db1a9/download/trenuri-2025-2026_transferoviar-calatori.xml',
+  'astra.xml':         'https://data.gov.ro/dataset/1d057a43-3eaa-4fed-a349-4106f3ad0e49/resource/aab96a77-0fbe-4770-8408-e7b23c90480d/download/trenuri-2025-2026_astratranscarpatic.xml',
+};
+
+const DATA_DIR = path.join(__dirname, 'data');
 
 // GPS coordinates for all Romanian railway stations
 const STATION_GPS_URL = 'https://raw.githubusercontent.com/vasile/data.gov.ro-gtfs-exporter/master/cfr.webgis.ro/stops.geojson';
@@ -625,21 +624,20 @@ async function loadData() {
     console.warn('[boot] GPS failed:', e.message);
   }
 
-  // 2. Load each timetable XML
+  // 2. Load each timetable XML from local /data/ folder
   let total = 0;
   for (const src of XML_SOURCES) {
     loadStatus = `loading ${src.operator}...`;
     try {
-      console.log(`[boot] Fetching ${src.operator}...`);
-      const r = await get(src.url, 90000);
-
-      if (r.status !== 200) {
-        console.warn(`[boot] ${src.operator}: HTTP ${r.status}`);
+      const filePath = path.join(DATA_DIR, src.file);
+      if (!fs.existsSync(filePath)) {
+        console.warn(`[boot] ${src.operator}: file not found at ${filePath} — skipping`);
         continue;
       }
-
-      console.log(`[boot] ${src.operator}: ${(r.body.length / 1024).toFixed(0)} KB`);
-      const parsed = parseCFRXmlV2(r.body, src.operator);
+      console.log(`[boot] Reading ${src.operator} from ${src.file}...`);
+      const xmlBody = fs.readFileSync(filePath, 'utf8');
+      console.log(`[boot] ${src.operator}: ${(xmlBody.length / 1024).toFixed(0)} KB`);
+      const parsed = parseCFRXmlV2(xmlBody, src.operator);
       
       // Log XML structure sample for debugging ghost trains
       if (parsed.length > 0) {
@@ -648,7 +646,7 @@ async function loadData() {
         if (sample.schedule && sample.schedule.length > 0) {
           console.log(`[XML-STRUCT] Sample schedule:`, JSON.stringify(sample.schedule[0]));
         } else {
-          const rawSample = r.body.slice(0, 3000);
+          const rawSample = xmlBody.slice(0, 3000);
           const hasCalendarTren = rawSample.includes('CalendarTren');
           const hasZile = rawSample.includes('ZileSaptamana');
           const hasTrasa = rawSample.includes('Trasa');
@@ -1219,22 +1217,28 @@ app.get('/api/xmltest', async (req, res) => {
     };
   } catch(e) { results.iris = { error: e.message }; }
   
-  // Test 2: Check XML structure
+  // Test 2: Check local XML files
   try {
-    const xmlR = await get(XML_SOURCES[0].url, 30000);
-    const xml = xmlR.body || '';
+    const firstSrc = XML_SOURCES[0];
+    const filePath = path.join(DATA_DIR, firstSrc.file);
+    const xml = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '';
     results.xml = {
+      file: firstSrc.file,
+      exists: fs.existsSync(filePath),
       length: xml.length,
-      hasZileSaptamana: xml.includes('ZileSaptamana'),
       hasCalendarTren: xml.includes('CalendarTren'),
       hasRestrictiiTren: xml.includes('RestrictiiTren'),
       hasTrasa: xml.includes('<Trasa'),
-      hasPerioda: xml.includes('Perioada'),
-      // Show first <Tren> element raw
       firstTren: (xml.match(/<Tren\b[^>]*>[\s\S]{0,800}?<\/Tren>/) || ['not found'])[0],
-      // Show first 500 chars
       first500: xml.slice(0, 500),
     };
+    // Check all files exist
+    results.files = XML_SOURCES.map(s => ({
+      file: s.file,
+      operator: s.operator,
+      exists: fs.existsSync(path.join(DATA_DIR, s.file)),
+      size: fs.existsSync(path.join(DATA_DIR, s.file)) ? Math.round(fs.statSync(path.join(DATA_DIR, s.file)).size / 1024) + ' KB' : 'missing',
+    }));
     // Count trains with schedule
     let withSched = 0, total = 0;
     const re = /<Tren\b[^>]*>([\s\S]*?)<\/Tren>/g;
@@ -1263,6 +1267,31 @@ app.get('/api/xmltest', async (req, res) => {
   results.today = todayStr();
   
   res.json(results);
+});
+
+// POST /api/refresh-xml?key=SECRET — re-download XMLs from data.gov.ro into /data/
+// Use once a year when new timetable is released (Dec).
+app.post('/api/refresh-xml', async (req, res) => {
+  const secret = process.env.REFRESH_SECRET;
+  if (secret && req.query.key !== secret) {
+    return res.status(403).json({ error: 'Forbidden — set ?key=REFRESH_SECRET' });
+  }
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  const results = [];
+  for (const [file, url] of Object.entries(XML_URLS)) {
+    try {
+      console.log(`[refresh] Downloading ${file}...`);
+      const r = await get(url, 120000);
+      if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
+      fs.writeFileSync(path.join(DATA_DIR, file), r.body, 'utf8');
+      results.push({ file, status: 'ok', size: Math.round(r.body.length / 1024) + ' KB' });
+    } catch (e) {
+      results.push({ file, status: 'error', error: e.message });
+    }
+  }
+  trains.clear(); stationIndex.clear(); dataReady = false;
+  loadData().catch(e => console.error('[refresh] reload error:', e.message));
+  res.json({ message: 'Refresh started — reload takes ~30s', results });
 });
 
 // GET /api/stations?q=Brasov
