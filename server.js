@@ -206,6 +206,12 @@ function durStr(mins) {
   if (mins <= 0) return '';
   return `${Math.floor(mins / 60)}h ${mins % 60}m`;
 }
+function addMins(timeStr, mins) {
+  if (!timeStr || mins == null) return timeStr;
+  const [h, m] = timeStr.split(':').map(Number);
+  const total = h * 60 + m + mins;
+  return `${String(Math.floor(total/60)%24).padStart(2,'0')}:${String(total%60).padStart(2,'0')}`;
+}
 
 // Parse DD.MM.YYYY → JS Date object (noon, to avoid DST issues)
 function parseRoDate(str) {
@@ -839,71 +845,80 @@ function searchJourneys(fromName, toName, dateStr) {
     .slice(0, 200); // full day of trains
 }
 
-// ─── REAL-TIME DELAY (IRIS) ────────────────────────────────────────────────
+// ─── REAL-TIME DELAY ───────────────────────────────────────────────────────
+// Source: mersultrenurilor.infofer.ro (confirmed reachable from Render)
+// appiris.infofer.ro is blocked from Render (getaddrinfo ENOTFOUND)
 async function getLiveDelay(trainNumber) {
   const key    = 'live:' + trainNumber;
   const cached = cacheGet(key);
   if (cached !== null) return cached;
 
+  const noData = {
+    trainNumber, delay: null, onTime: null,
+    stationDelays: [], liveAvailable: false,
+    updatedAt: new Date().toISOString(),
+  };
+
   try {
+    const today = todayStr();
+    const url = `https://mersultrenurilor.infofer.ro/ro-RO/Tren/Info-tren?tren=${encodeURIComponent(trainNumber)}&data=${encodeURIComponent(today)}`;
     const resp = await Promise.race([
-      get(IRIS_URL(trainNumber), 8000),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('iris timeout')), 8000)),
+      get(url, 10000),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 10000)),
     ]);
 
-    const html = resp.body;
+    const html = resp.body || '';
 
-    // Extract delay
-    const delayM = html.match(/(?:întârziere|intarziere)[^<\d]*?(\d+)\s*min/i)
-                || html.match(/delay[^<\d]*?(\d+)\s*min/i);
-    const delay   = delayM ? parseInt(delayM[1]) : 0;
+    // Not running today
+    if (/nu circul[aă]/i.test(html)) {
+      const result = { ...noData, liveAvailable: true, notRunning: true, delay: null };
+      cacheSet(key, result, 3600);
+      return result;
+    }
 
-    // Extract per-station delay info from table
+    // Extract current delay — InfoFer shows "întârziere: X min" or "Întârziere X minute"
+    const delayM = html.match(/[îi]nt[âa]rziere[^<\d]*?(\d+)\s*min/i)
+                || html.match(/>(\d+)\s*(?:min|minute)\s*[îi]nt[âa]rziere/i)
+                || html.match(/class="[^"]*intarziere[^"]*"[^>]*>\s*(\d+)/i);
+    const delay = delayM ? parseInt(delayM[1]) : 0;
+
+    // Extract per-station rows from the timetable table
+    // InfoFer table columns: Station | Sched arr | Sched dep | Actual arr | Actual dep | Delay
     const stationDelays = [];
-    const rows          = html.match(/<tr[^>]*>[\s\S]*?<\/tr>/gi) || [];
+    const rows = html.match(/<tr[^>]*>[\s\S]*?<\/tr>/gi) || [];
     for (const row of rows) {
-      const cells = (row.match(/<td[^>]*>([\s\S]*?)<\/td>/gi) || []).map(c => stripTags(c));
-      if (cells.length >= 2 && /\d{2}:\d{2}/.test(cells[1] || '')) {
+      const cells = (row.match(/<td[^>]*>([\s\S]*?)<\/td>/gi) || []).map(c => stripTags(c).trim());
+      if (cells.length >= 3 && /\d{2}:\d{2}/.test(cells[1] || '')) {
+        const delayVal = cells.find(c => /^\d+$/.test(c.trim()) && parseInt(c) < 500);
         stationDelays.push({
           name:      cells[0],
-          scheduled: cells[1],
-          actual:    cells[2] || null,
-          delay:     parseInt(cells[3]) || 0,
+          schedDep:  cells[1] || null,
+          actualDep: cells[2] || null,
+          delay:     delayVal ? parseInt(delayVal) : 0,
         });
       }
     }
 
-    // Extract platform/line number - IRIS shows "Linia X" or "Peronul X"  
-    const platformM = html.match(/[Ll]inia\s*(\d+)/i)
-                    || html.match(/[Pp]eron(?:ul)?\s*(\d+)/i)
-                    || html.match(/[Tt]rack\s*(\d+)/i);
-    const platform = platformM ? platformM[1] : null;
+    // Current position: find last station with actual time filled in
+    const passed = stationDelays.filter(s => s.actualDep);
+    const currentStation = passed.length > 0 ? passed[passed.length - 1].name : null;
 
     const result = {
       trainNumber,
       delay,
-      platform,
-      onTime:        delay === 0,
+      onTime:         delay === 0,
+      currentStation,
       stationDelays,
-      liveAvailable: true,
-      updatedAt:     new Date().toISOString(),
+      liveAvailable:  true,
+      updatedAt:      new Date().toISOString(),
     };
 
     cacheSet(key, result, 60); // cache 60 seconds
     return result;
 
   } catch (err) {
-    const result = {
-      trainNumber,
-      delay:         0,
-      onTime:        true,
-      stationDelays: [],
-      liveAvailable: false,
-      error:         err.message,
-      updatedAt:     new Date().toISOString(),
-    };
-    cacheSet(key, result, 30);
-    return result;
+    cacheSet(key, noData, 30);
+    return noData;
   }
 }
 
@@ -1374,7 +1389,43 @@ app.get('/api/itineraries', async (req, res) => {
     j.legs.every(l => !l.number || validNums.has(l.number))
   );
 
-  cacheSet(key, journeys, 300); // cache 5 minutes
+  // ── Attach live delays (only for today's searches) ──────────────────────
+  const isToday = date === todayStr();
+  if (isToday && journeys.length > 0) {
+    const uniqueNums = [...new Set(journeys.flatMap(j => j.legs.map(l => l.number).filter(Boolean)))];
+    // Fetch delays in parallel (max 10 at once to avoid hammering InfoFer)
+    const delayMap = {};
+    for (let i = 0; i < uniqueNums.length; i += 10) {
+      const batch = uniqueNums.slice(i, i + 10);
+      const results = await Promise.all(batch.map(async num => {
+        const d = await getLiveDelay(num);
+        return [num, d];
+      }));
+      results.forEach(([num, d]) => { delayMap[num] = d; });
+    }
+    // Attach delay info to each leg
+    journeys.forEach(j => {
+      j.legs.forEach(l => {
+        if (l.number && delayMap[l.number]) {
+          const d = delayMap[l.number];
+          l.delay         = d.delay;          // minutes late (null = no data)
+          l.onTime        = d.onTime;
+          l.liveAvailable = d.liveAvailable;
+          l.currentStation = d.currentStation || null;
+          if (d.delay > 0) {
+            // Adjust arrival estimate
+            l.delayedArr = addMins(l.arr, d.delay);
+          }
+        }
+      });
+      // Journey-level delay = max delay across all legs
+      const delays = j.legs.map(l => l.delay).filter(d => d !== null && d !== undefined);
+      j.maxDelay    = delays.length > 0 ? Math.max(...delays) : null;
+      j.hasLiveData = j.legs.some(l => l.liveAvailable);
+    });
+  }
+
+  cacheSet(key, journeys, 60); // cache 1 min (shorter when delays attached)
   return res.json({ source: 'live', from, to, date, journeys, count: journeys.length });
 });
 
