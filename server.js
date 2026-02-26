@@ -221,10 +221,29 @@ function dateToDow(str) {
   return d ? d.getDay() : -1;
 }
 
+// ─── BITMASK SCHEDULE CHECK ─────────────────────────────────────────────────
+// Some operators encode run-days as a binary bitmask string where each bit
+// represents a day since the rail year start (2025-12-14).
+// '1' = train runs that day, '0' = does not.
+function isScheduledForDate(train, dateObj) {
+  if (!train.bitmask || train.bitmask.length < 300) return null; // no bitmask → inconclusive
+  const railYearStart = new Date('2025-12-14T00:00:00Z');
+  const dayIndex = Math.floor((dateObj - railYearStart) / (1000 * 60 * 60 * 24));
+  if (dayIndex < 0 || dayIndex >= train.bitmask.length) return false;
+  return train.bitmask[dayIndex] === '1';
+}
+
 // ZileSaptamana in CFR XML is a string like "12345" meaning Mon–Fri,
 // or "1234567" meaning daily. Each digit = day number: 1=Mon, 2=Tue … 7=Sun.
 // Returns true if the given date (DD.MM.YYYY) falls on an operating day.
 function trainRunsOnDate(train, dateStr) {
+  // ── Bitmask check first (most precise) ────────────────────────────────────
+  const dateObj = parseRoDate(dateStr);
+  if (dateObj) {
+    const bitmaskResult = isScheduledForDate(train, dateObj);
+    if (bitmaskResult !== null) return bitmaskResult;
+  }
+
   // ── No schedule data: apply operator-specific fallbacks ──────────────────
   if (!train.schedule || train.schedule.length === 0) {
     // ATC (Astra Trans Carpatic) trains with no schedule data:
@@ -1381,10 +1400,16 @@ app.get('/api/board/:stationName', async (req, res) => {
   }
 
   const date = todayStr();
+  const dateObj = new Date();
   const rawDeps = [];
   for (const tNum of nums) {
     const train = trains.get(tNum);
     if (!train) continue;
+    // Quick bitmask check before doing any other work
+    const bitmaskOk = isScheduledForDate(train, dateObj);
+    if (bitmaskOk === false) continue;
+    // XML schedule check
+    if (!trainRunsOnDate(train, date)) continue;
     const st = train.stations.find(s => norm(s.name) === n);
     if (!st) continue;
     const dep = st.dep || st.arr;
