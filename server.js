@@ -31,10 +31,9 @@ const XML_SOURCES = [
     operator: 'Astra Trans Carpatic',
     url: 'https://data.gov.ro/dataset/1d057a43-3eaa-4fed-a349-4106f3ad0e49/resource/aab96a77-0fbe-4770-8408-e7b23c90480d/download/trenuri-2025-2026_astratranscarpatic.xml'
   },
-  {
-    operator: 'Softrans',
-    url: 'https://data.gov.ro/dataset/e4ba7432-2904-4cc4-9588-2afbf021756e/resource/3bf9600e-7ae4-45fb-a46e-8184576544a1/download/trenuri-2025-2026_softrans.xml'
-  },
+  // NOTE: Softrans XML removed — their data.gov.ro file contains wrong train numbers
+  // (shows IR 1683 etc. which are CFR Călători numbers). Softrans real trains are
+  // in the 11xxx range and run Craiova-Brasov-Bucuresti, not Bucuresti-Constanta.
 ];
 
 // GPS coordinates for all Romanian railway stations
@@ -591,6 +590,15 @@ async function loadData() {
       console.log(`[boot] ${src.operator}: ${parsed.length} trains parsed`);
 
       for (const train of parsed) {
+        // Duplicate number guard: if this number already exists from a different operator,
+        // keep the existing entry. This prevents private operator XMLs from accidentally
+        // overwriting CFR Călători numbers with wrong data (as Softrans XML did).
+        const existing = trains.get(train.number);
+        if (existing && existing.operator !== train.operator) {
+          console.warn(`[dedup] Train ${train.number}: ${src.operator} conflicts with ${existing.operator} — keeping ${existing.operator}`);
+          continue; // skip duplicate
+        }
+
         trains.set(train.number, train);
 
         // Index by every station name
