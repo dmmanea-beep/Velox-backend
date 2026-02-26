@@ -244,6 +244,30 @@ function trainRunsOnDate(train, dateStr) {
     if (bitmaskResult !== null) return bitmaskResult;
   }
 
+  // ── CalendarTren format (CFR v4 schema: DeLa/PinaLa/Zile/Tip) ───────────
+  const calEntries = train.schedule && train.schedule.filter(s => s.DeLa);
+  if (calEntries && calEntries.length > 0) {
+    const jsDay = dateObj ? dateObj.getUTCDay() : new Date().getUTCDay(); // 0=Sun
+    const cfrBit = jsDay === 0 ? 6 : jsDay - 1; // Mon=0 … Sun=6
+    const ymd = dateObj ? `${dateObj.getUTCFullYear()}${String(dateObj.getUTCMonth()+1).padStart(2,'0')}${String(dateObj.getUTCDate()).padStart(2,'0')}` : '';
+
+    let inAnyRange = false;
+    for (const e of calEntries) {
+      if (ymd < e.DeLa || ymd > e.PinaLa) continue;
+      inAnyRange = true;
+      const zileMask = parseInt(e.Zile) & 0x7F;
+      const dayRuns = !!(zileMask & (1 << cfrBit));
+      if (e.Tip === 'Nu') {
+        if (dayRuns) return false; // explicit exception
+      } else {
+        if (dayRuns) return true;  // confirmed runs
+      }
+    }
+    // If date was in at least one range but no entry confirmed it runs → false
+    // If date is outside ALL ranges → false (not scheduled for this period)
+    return false;
+  }
+
   // ── No schedule data: apply operator-specific fallbacks ──────────────────
   if (!train.schedule || train.schedule.length === 0) {
     // ATC (Astra Trans Carpatic) trains with no schedule data:
@@ -290,6 +314,7 @@ function trainRunsOnDate(train, dateStr) {
   const targetDate = parseRoDate(dateStr);
 
   for (const sch of train.schedule) {
+    if (sch.DeLa) continue; // CalendarTren entries already handled above
     // Check date range
     if (sch.dateStart && sch.dateEnd) {
       const ds = parseRoDate(sch.dateStart);
@@ -497,57 +522,43 @@ function parseCFRXmlV2(xml, defaultOperator) {
     const number   = numM[1].trim();
     const category = catM ? catM[1].trim() : '';
 
-    // ── Extract schedule (days of operation) ──────────────────────────────
-    // Helper to extract schedule fields from an attribute string
-    function extractSched(ta) {
-      const daysM  = ta.match(/ZileSaptamana="([^"]+)"/i)
-                  || ta.match(/ZileSapt="([^"]+)"/i)
-                  || ta.match(/DaysOfWeek="([^"]+)"/i)
-                  || ta.match(/Zile="([^"]+)"/i);
-      const startM = ta.match(/DataInceput="([^"]+)"/i)
-                  || ta.match(/DataStart="([^"]+)"/i)
-                  || ta.match(/StartDate="([^"]+)"/i)
-                  || ta.match(/De="([^"]+)"/i);
-      const endM   = ta.match(/DataSfarsit="([^"]+)"/i)
-                  || ta.match(/DataFinal="([^"]+)"/i)
-                  || ta.match(/DataSfir="([^"]+)"/i)
-                  || ta.match(/EndDate="([^"]+)"/i)
-                  || ta.match(/Pana="([^"]+)"/i);
-      if (daysM || startM || endM) {
-        return {
-          days:      daysM  ? daysM[1].trim()  : '',
-          dateStart: startM ? startM[1].trim() : '',
-          dateEnd:   endM   ? endM[1].trim()   : '',
-        };
-      }
-      return null;
-    }
-
+    // ── Extract schedule from <RestrictiiTren><CalendarTren> ─────────────────
+    // Format: <CalendarTren DeLa="YYYYMMDD" PinaLa="YYYYMMDD" Tip="Da"|"Nu" Zile="NNN"/>
+    // Zile is a decimal integer; bits 0-6 = Mon-Sun (bit 0=Mon, bit 6=Sun)
     const schedule = [];
-
-    // Format 1: dates/days on the <Tren> element itself
-    const trenSched = extractSched(attrs);
-    if (trenSched) schedule.push(trenSched);
-
-    // Format 2: child elements <Trasa>, <Circulatie>, <Calendar>, etc.
-    const schedTagRe = /<(?:Trasa|Circulatie|Calendar|Serviciu|Grafic|PerioadaCirculatie)\b([^>]*)>/gi;
-    let schedM;
-    while ((schedM = schedTagRe.exec(body)) !== null) {
-      const s = extractSched(schedM[1]);
-      if (s) schedule.push(s);
+    const calRe = /<CalendarTren\b([^>]*)\/>/gi;
+    let calM;
+    while ((calM = calRe.exec(body)) !== null) {
+      const ca = calM[1];
+      const delaM  = ca.match(/DeLa="([^"]+)"/i);
+      const pinaM  = ca.match(/PinaLa="([^"]+)"/i);
+      const zileM  = ca.match(/Zile="([^"]+)"/i);
+      const tipM   = ca.match(/Tip="([^"]+)"/i);
+      if (delaM && pinaM && zileM) {
+        schedule.push({
+          DeLa:  delaM[1].trim(),
+          PinaLa: pinaM[1].trim(),
+          Zile:  zileM[1].trim(),
+          Tip:   tipM ? tipM[1].trim() : 'Da',
+        });
+      }
     }
 
-    // Format 3: ZileSaptamana as child text element
+    // Fallback: legacy ZileSaptamana format (other operators)
     if (schedule.length === 0) {
-      const zileEl  = body.match(/<ZileSaptamana[^>]*>([^<]+)<\/ZileSaptamana>/i);
-      const startEl = body.match(/<(?:DataInceput|DataStart)[^>]*>([^<]+)<\/(?:DataInceput|DataStart)>/i);
-      const endEl   = body.match(/<(?:DataSfarsit|DataFinal)[^>]*>([^<]+)<\/(?:DataSfarsit|DataFinal)>/i);
-      if (zileEl || startEl || endEl) {
-        schedule.push({
-          days:      zileEl  ? zileEl[1].trim()  : '',
-          dateStart: startEl ? startEl[1].trim() : '',
-          dateEnd:   endEl   ? endEl[1].trim()   : '',
-        });
+      const legacyRe = /<(?:Trasa|Circulatie|Calendar|Serviciu|GraficCirculatie|PerioadaCirculatie)\b([^>]*)>/gi;
+      let legM;
+      while ((legM = legacyRe.exec(body)) !== null) {
+        const la = legM[1];
+        const daysM  = la.match(/ZileSaptamana="([^"]+)"/i) || la.match(/ZileSapt="([^"]+)"/i)
+                    || la.match(/DaysOfWeek="([^"]+)"/i)    || la.match(/BitSet="([^"]+)"/i);
+        const startM = la.match(/DataInceput="([^"]+)"/i)   || la.match(/DataStart="([^"]+)"/i)
+                    || la.match(/De="([^"]+)"/i);
+        const endM   = la.match(/DataSfarsit="([^"]+)"/i)   || la.match(/DataFinal="([^"]+)"/i)
+                    || la.match(/Pana="([^"]+)"/i);
+        if (daysM || startM || endM) {
+          schedule.push({ legacy: true, days: daysM?daysM[1].trim():'', dateStart: startM?startM[1].trim():'', dateEnd: endM?endM[1].trim():'' });
+        }
       }
     }
 
@@ -636,14 +647,11 @@ async function loadData() {
         if (sample.schedule && sample.schedule.length > 0) {
           console.log(`[XML-STRUCT] Sample schedule:`, JSON.stringify(sample.schedule[0]));
         } else {
-          // Try to find ZileSaptamana in raw XML for diagnosis
           const rawSample = r.body.slice(0, 3000);
+          const hasCalendarTren = rawSample.includes('CalendarTren');
           const hasZile = rawSample.includes('ZileSaptamana');
           const hasTrasa = rawSample.includes('Trasa');
-          const hasCirculatie = rawSample.includes('Circulatie');
-          const hasCalendar = rawSample.includes('Calendar');
-          console.log(`[XML-STRUCT] No schedule found. Raw XML has: ZileSaptamana=${hasZile}, Trasa=${hasTrasa}, Circulatie=${hasCirculatie}, Calendar=${hasCalendar}`);
-          // Show first 1000 chars of XML for structure inspection
+          console.log(`[XML-STRUCT] No schedule on first train. Raw XML has: CalendarTren=${hasCalendarTren}, ZileSaptamana=${hasZile}, Trasa=${hasTrasa}`);
           console.log('[XML-STRUCT] First 800 chars:', rawSample.slice(0, 800).replace(/\s+/g, ' '));
         }
         // Count trains with/without schedule
@@ -1083,6 +1091,8 @@ app.get('/api/xmltest', async (req, res) => {
     results.xml = {
       length: xml.length,
       hasZileSaptamana: xml.includes('ZileSaptamana'),
+      hasCalendarTren: xml.includes('CalendarTren'),
+      hasRestrictiiTren: xml.includes('RestrictiiTren'),
       hasTrasa: xml.includes('<Trasa'),
       hasPerioda: xml.includes('Perioada'),
       // Show first <Tren> element raw
@@ -1096,7 +1106,8 @@ app.get('/api/xmltest', async (req, res) => {
     let m;
     while ((m = re.exec(xml)) !== null && total < 100) {
       total++;
-      if (/ZileSaptamana/.test(m[1])) withSched++;
+      if (/CalendarTren/.test(m[1]) || /ZileSaptamana/.test(m[1])) withSched++;
+    }
     }
     results.xml.trainsChecked = total;
     results.xml.withSchedule = withSched;
