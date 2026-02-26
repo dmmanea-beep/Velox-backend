@@ -1,5 +1,19 @@
 {
   "name": "velox-backend",
+  "version": "4.2.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.0",
+    "cheerio": "^1.0.0",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5"
+  }
+}{
+  "name": "velox-backend",
   "version": "4.0.0",
   "description": "Velox API - Romanian train timetable + real-time delays",
   "main": "server.js",
