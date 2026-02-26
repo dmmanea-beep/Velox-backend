@@ -8,9 +8,10 @@ const cheerio = require('cheerio');
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET', 'OPTIONS'] }));
-app.options('*', cors());
 
-// ─── DATA SOURCES ──────────────────────────────────────────────────────────
+// ─── CONFIGURATION ─────────────────────────────────────────────────────────
+const RAIL_YEAR_START = new Date('2025-12-14T00:00:00Z');
+const STATION_GPS_URL = 'https://raw.githubusercontent.com/vasile/data.gov.ro-gtfs-exporter/master/cfr.webgis.ro/stops.geojson';
 const XML_SOURCES = [
   { operator: 'CFR Călători', url: 'https://data.gov.ro/dataset/c4f71dbb-de39-49b2-b697-5b60a5f299a2/resource/0f67143e-bb88-4a06-8e7a-b35b1eb91329/download/trenuri-2025-2026_sntfc.xml' },
   { operator: 'Interregional Călători', url: 'https://data.gov.ro/dataset/b4e2ce0b-6935-44b1-8e9d-f3999123358a/resource/1a083cf5-d37c-4618-aeb8-3f1ba0dd22dc/download/trenuri-2025-2026_interregional-calatori.xml' },
@@ -19,12 +20,6 @@ const XML_SOURCES = [
   { operator: 'Astra Trans Carpatic', url: 'https://data.gov.ro/dataset/1d057a43-3eaa-4fed-a349-4106f3ad0e49/resource/aab96a77-0fbe-4770-8408-e7b23c90480d/download/trenuri-2025-2026_astratranscarpatic.xml' }
 ];
 
-const STATION_GPS_URL = 'https://raw.githubusercontent.com/vasile/data.gov.ro-gtfs-exporter/master/cfr.webgis.ro/stops.geojson';
-const IRIS_URL = (trainNum) => `https://appiris.infofer.ro/MyTrainRO.aspx?tren=${encodeURIComponent(trainNum)}`;
-
-// --- 2025-2026 RAIL YEAR CONFIGURATION ---
-const RAIL_YEAR_START = new Date('2025-12-14T00:00:00Z');
-
 // ─── IN-MEMORY STORE ───────────────────────────────────────────────────────
 let trains       = new Map();  
 let stationIndex = new Map();  
@@ -32,11 +27,7 @@ let stationGPS   = new Map();
 let dataReady    = false;
 let loadStatus   = 'starting';
 
-const _cache = {};
-const cacheGet = (k) => { const i = _cache[k]; return (i && Date.now() < i.e) ? i.v : null; };
-const cacheSet = (k, v, s) => { _cache[k] = { v, e: Date.now() + s * 1000 }; };
-
-// ─── LAYER 1: BITMASK VALIDATION (RESEARCH METHOD 1) ──────────────────────
+// ─── GHOST-BUSTER BRAINS ───────────────────────────────────────────────────
 function isScheduledByBitmask(train, targetDate = new Date()) {
   if (!train.bitmask || train.bitmask.length < 300) return null;
   const dayIndex = Math.floor((targetDate - RAIL_YEAR_START) / 86400000);
@@ -44,7 +35,6 @@ function isScheduledByBitmask(train, targetDate = new Date()) {
   return train.bitmask[dayIndex] === '1';
 }
 
-// ─── LAYER 2: AUTHORITATIVE IRIS HANDSHAKE (RESEARCH METHOD 2) ──────────────
 async function getLiveIRISBoard(stationName) {
   const url = 'http://appiris.infofer.ro/SosPlcRO.aspx';
   try {
@@ -68,13 +58,26 @@ async function getLiveIRISBoard(stationName) {
       if (match) activeTrains.add(match[1]);
     });
     return activeTrains;
-  } catch (e) {
-    console.error(`[IRIS Handshake Error] ${stationName}:`, e.message);
-    return null; 
-  }
+  } catch (e) { return null; }
 }
 
 // ─── HELPERS ───────────────────────────────────────────────────────────────
+function norm(name) {
+  return (name || '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function todayStr() {
+  const d = new Date();
+  return `${String(d.getDate()).padStart(2,'0')}.${String(d.getMonth()+1).padStart(2,'0')}.${d.getFullYear()}`;
+}
+
+function resolveStation(userInput) {
+  const n = norm(userInput);
+  if (stationIndex.has(n)) return n;
+  for (const key of stationIndex.keys()) { if (key.startsWith(n + ' ') || key === n) return key; }
+  return n;
+}
+
 function secToTime(sec) {
   if (sec == null || sec === '') return null;
   const s = parseInt(sec);
@@ -84,55 +87,11 @@ function secToTime(sec) {
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
 }
 
-function timeToMins(t) {
-  if (!t) return -1;
-  const [h, m] = t.split(':').map(Number);
-  return h * 60 + m;
-}
-
-function norm(name) {
-  return (name || '').trim().toLowerCase()
-    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
-}
-
-function resolveStation(userInput) {
-  const n = norm(userInput);
-  if (stationIndex.has(n)) return n;
-  for (const key of stationIndex.keys()) {
-    if (key.startsWith(n + ' ') || key === n) return key;
-  }
-  for (const key of stationIndex.keys()) {
-    if (key.includes(n)) return key;
-  }
-  return n;
-}
-
-function guessType(cat) {
-  const c = (cat || '').toUpperCase();
-  if (c === 'EC') return 'EuroCity';
-  if (c === 'IC') return 'InterCity';
-  if (c === 'IR') return 'InterRegio';
-  if (c === 'RE' || c === 'RX') return 'RegioExpress';
-  if (c === 'R') return 'Regio';
-  return 'Tren';
-}
-
-function stripTags(s) {
-  return (s || '').replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').trim();
-}
-
-function todayStr() {
-  const d = new Date();
-  return `${String(d.getDate()).padStart(2,'0')}.${String(d.getMonth()+1).padStart(2,'0')}.${d.getFullYear()}`;
-}
-
-// ─── XML PARSER ────────────────────────────────────────────────────────────
+// ─── PARSER ────────────────────────────────────────────────────────────────
 function parseCFRXmlV2(xml, defaultOperator) {
   const result = [];
   const trainRe = /<Tren\b([^>]*)>([\s\S]*?)<\/Tren>/g;
   let tm;
-
   while ((tm = trainRe.exec(xml)) !== null) {
     const attrs = tm[1];
     const body  = tm[2];
@@ -140,109 +99,77 @@ function parseCFRXmlV2(xml, defaultOperator) {
     const catM = attrs.match(/CategorieTren="([^"]+)"/);
     if (!numM) continue;
 
-    const number = numM[1].trim();
-    const category = catM ? catM[1].trim() : '';
-
-    // Extract Bitmask for Layer 1 validation
     const bitmaskM = body.match(/BitMask="([^"]+)"/i) || attrs.match(/BitMask="([^"]+)"/i);
     const bitmask = bitmaskM ? bitmaskM[1] : null;
 
     const allElems = [...body.matchAll(/<ElementTrasa\b([^>]*)\/>/g)];
     const stations = [];
-
     allElems.forEach((em) => {
       const ea = em[1];
       const oName = (ea.match(/DenStaOrigine="([^"]+)"/) || [])[1];
       const oraP = (ea.match(/OraP="([^"]+)"/) || [])[1];
       if (oName) stations.push({ name: oName, dep: secToTime(oraP) });
     });
-
     if (stations.length >= 2) {
-      result.push({ number, category, type: guessType(category), operator: defaultOperator, stations, bitmask });
+      result.push({ number: numM[1].trim(), category: catM?catM[1].trim():'', operator: defaultOperator, stations, bitmask });
     }
   }
   return result;
 }
 
-// ─── LOAD DATA ─────────────────────────────────────────────────────────────
+// ─── DATA LOADING ──────────────────────────────────────────────────────────
 async function loadData() {
   loadStatus = 'loading...';
   try {
-    const response = await axios.get(STATION_GPS_URL);
-    for (const f of response.data.features) {
-      const [lng, lat] = f.geometry.coordinates;
-      stationGPS.set(norm(f.properties.name), { name: f.properties.name, lat, lng });
+    const r = await axios.get(STATION_GPS_URL);
+    for (const f of r.data.features) {
+      stationGPS.set(norm(f.properties.name), { name: f.properties.name, lat: f.geometry.coordinates[1], lng: f.geometry.coordinates[0] });
     }
-  } catch (e) { console.error("GPS Load Failed", e.message); }
+  } catch (e) { console.error("GPS Fail"); }
 
   for (const src of XML_SOURCES) {
     try {
       const r = await axios.get(src.url, { timeout: 60000 });
       const parsed = parseCFRXmlV2(r.data, src.operator);
-      for (const train of parsed) {
-        trains.set(train.number, train);
-        for (const st of train.stations) {
+      for (const t of parsed) {
+        trains.set(t.number, t);
+        for (const st of t.stations) {
           const n = norm(st.name);
           if (!stationIndex.has(n)) stationIndex.set(n, new Set());
-          stationIndex.get(n).add(train.number);
+          stationIndex.get(n).add(t.number);
         }
       }
-    } catch (e) { console.error(`Error loading ${src.operator}:`, e.message); }
+    } catch (e) { console.error(`Source Fail: ${src.operator}`); }
   }
   dataReady = true;
   loadStatus = 'ready';
-  console.log(`READY: ${trains.size} trains loaded.`);
 }
 
-// ─── ROUTES ────────────────────────────────────────────────────────────────
-
-// THE GHOST-BUSTER VERSION
+// ─── API ROUTES ────────────────────────────────────────────────────────────
 app.get('/api/board/:stationName', async (req, res) => {
-  if (!dataReady) return res.status(503).json({ error: 'Loading 2025-2026 data...' });
-
-  const stInput = req.params.stationName.trim();
-  const n = resolveStation(stInput);
-  const gps = stationGPS.get(n);
-
+  if (!dataReady) return res.status(503).json({ error: 'Loading...' });
+  const n = resolveStation(req.params.stationName);
   const nums = stationIndex.get(n);
-  if (!nums) return res.status(404).json({ error: `Station "${stInput}" not found` });
+  if (!nums) return res.status(404).json({ error: 'Not found' });
 
   const today = new Date();
-  const candidates = Array.from(nums)
-    .map(num => trains.get(num))
-    .filter(t => isScheduledByBitmask(t, today) !== false);
-
-  const liveList = await getLiveIRISBoard(stInput);
+  const candidates = Array.from(nums).map(num => trains.get(num)).filter(t => isScheduledByBitmask(t, today) !== false);
+  const liveList = await getLiveIRISBoard(req.params.stationName);
 
   const departures = candidates.map(t => {
     const isLive = liveList ? liveList.has(t.number) : null;
-    if (isLive === false) return null; // GHOST BUSTED
-
+    if (isLive === false) return null; // Ghost Busted
     const st = t.stations.find(s => norm(s.name) === n);
-    return {
-      time: st ? st.dep : '--:--',
-      train: `${t.category || ''} ${t.number}`.trim(),
-      number: t.number,
-      operator: t.operator,
-      status: isLive === true ? 'confirmed' : 'unverified',
-      confidence: isLive === true ? 1.0 : 0.5
-    };
-  }).filter(Boolean).sort((a, b) => a.time.localeCompare(b.time));
+    return { time: st?.dep || '--:--', train: `${t.category} ${t.number}`, number: t.number, operator: t.operator, status: isLive ? 'confirmed' : 'unverified' };
+  }).filter(Boolean).sort((a,b) => a.time.localeCompare(b.time));
 
-  res.json({
-    station: stInput,
-    source: liveList ? 'IRIS+Bitmask' : 'Bitmask-Only (IRIS Offline)',
-    lat: gps?.lat || null,
-    lng: gps?.lng || null,
-    departures,
-    count: departures.length
-  });
+  res.json({ station: req.params.stationName, departures });
 });
 
 app.get('/health', (req, res) => res.json({ status: loadStatus, ready: dataReady, trains: trains.size }));
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`Server live on ${PORT}`);
   loadData();
 });
