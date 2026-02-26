@@ -225,7 +225,45 @@ function dateToDow(str) {
 // or "1234567" meaning daily. Each digit = day number: 1=Mon, 2=Tue … 7=Sun.
 // Returns true if the given date (DD.MM.YYYY) falls on an operating day.
 function trainRunsOnDate(train, dateStr) {
-  if (!train.schedule || train.schedule.length === 0) return true; // no data = assume runs
+  // ── No schedule data: apply operator-specific fallbacks ──────────────────
+  if (!train.schedule || train.schedule.length === 0) {
+    // ATC (Astra Trans Carpatic) trains with no schedule data:
+    // Their coastal trains (11500-11560) are SEASONAL: Jun 11 – Sep 6 only.
+    // Their non-coastal year-round trains (11561+) should have schedule data in XML.
+    const n = parseInt(train.number);
+    if (train.operator && train.operator.includes('Astra') && n >= 11500 && n <= 11560) {
+      const target = parseRoDate(dateStr);
+      const seasonStart = parseRoDate('11.06.2026');
+      const seasonEnd   = parseRoDate('06.09.2026');
+      if (target && seasonStart && seasonEnd) {
+        return target >= seasonStart && target <= seasonEnd;
+      }
+      return false; // can't parse date → hide it
+    }
+    // For Regio Călători trains with no schedule that serve coastal stations:
+    // These are seasonal (Jun-Sep). CFR Călători coastal trains run year-round.
+    if (train.operator && train.operator.includes('Regio')) {
+      const coastal = ['constanta', 'mangalia', 'neptun', 'olimp', 'eforie', 
+                       'costinesti', 'navodari', 'techirghiol'];
+      const hasCoastal = train.stations && train.stations.some(s => {
+        const sn = (s.name || '').toLowerCase()
+          .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+        return coastal.some(c => sn.includes(c));
+      });
+      if (hasCoastal) {
+        const target = parseRoDate(dateStr);
+        const seasonStart = parseRoDate('11.06.2026');
+        const seasonEnd   = parseRoDate('06.09.2026');
+        if (target && seasonStart && seasonEnd) {
+          return target >= seasonStart && target <= seasonEnd;
+        }
+        return false;
+      }
+    }
+    // All other operators/trains with no schedule: fail-open (assume runs)
+    return true;
+  }
+
   const dow = dateToDow(dateStr); // 0=Sun … 6=Sat
   // Convert JS dow (0=Sun) to CFR dow (1=Mon … 7=Sun)
   const cfrDow = dow === 0 ? 7 : dow; // Sun→7, Mon→1 … Sat→6
@@ -441,17 +479,8 @@ function parseCFRXmlV2(xml, defaultOperator) {
     const category = catM ? catM[1].trim() : '';
 
     // ── Extract schedule (days of operation) ──────────────────────────────
-    // Try multiple XML formats used by different Romanian operators:
-    // Format A: <Trasa ZileSaptamana="12345" DataInceput="01.12.2025" DataSfarsit="14.06.2026">
-    // Format B: <Circulatie ZileSaptamana="12345" ...>
-    // Format C: <Calendar ZileSaptamana="12345" ...>
-    // ZileSaptamana digits: 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat, 7=Sun
-    const schedule = [];
-    // Try all known element names that carry schedule data
-    const schedTagRe = /<(?:Trasa|Circulatie|Calendar|Serviciu|Grafic|PerioadaCirculatie)\b([^>]*)>/gi;
-    let schedM;
-    while ((schedM = schedTagRe.exec(body)) !== null) {
-      const ta = schedM[1];
+    // Helper to extract schedule fields from an attribute string
+    function extractSched(ta) {
       const daysM  = ta.match(/ZileSaptamana="([^"]+)"/i)
                   || ta.match(/ZileSapt="([^"]+)"/i)
                   || ta.match(/DaysOfWeek="([^"]+)"/i)
@@ -466,22 +495,37 @@ function parseCFRXmlV2(xml, defaultOperator) {
                   || ta.match(/EndDate="([^"]+)"/i)
                   || ta.match(/Pana="([^"]+)"/i);
       if (daysM || startM || endM) {
-        schedule.push({
+        return {
           days:      daysM  ? daysM[1].trim()  : '',
           dateStart: startM ? startM[1].trim() : '',
           dateEnd:   endM   ? endM[1].trim()   : '',
-        });
+        };
       }
+      return null;
     }
-    
-    // Also try to find ZileSaptamana as a direct child element: <ZileSaptamana>12345</ZileSaptamana>
+
+    const schedule = [];
+
+    // Format 1: dates/days on the <Tren> element itself
+    const trenSched = extractSched(attrs);
+    if (trenSched) schedule.push(trenSched);
+
+    // Format 2: child elements <Trasa>, <Circulatie>, <Calendar>, etc.
+    const schedTagRe = /<(?:Trasa|Circulatie|Calendar|Serviciu|Grafic|PerioadaCirculatie)\b([^>]*)>/gi;
+    let schedM;
+    while ((schedM = schedTagRe.exec(body)) !== null) {
+      const s = extractSched(schedM[1]);
+      if (s) schedule.push(s);
+    }
+
+    // Format 3: ZileSaptamana as child text element
     if (schedule.length === 0) {
-      const zileEl = body.match(/<ZileSaptamana[^>]*>([^<]+)<\/ZileSaptamana>/i);
+      const zileEl  = body.match(/<ZileSaptamana[^>]*>([^<]+)<\/ZileSaptamana>/i);
       const startEl = body.match(/<(?:DataInceput|DataStart)[^>]*>([^<]+)<\/(?:DataInceput|DataStart)>/i);
       const endEl   = body.match(/<(?:DataSfarsit|DataFinal)[^>]*>([^<]+)<\/(?:DataSfarsit|DataFinal)>/i);
-      if (zileEl) {
+      if (zileEl || startEl || endEl) {
         schedule.push({
-          days:      zileEl[1].trim(),
+          days:      zileEl  ? zileEl[1].trim()  : '',
           dateStart: startEl ? startEl[1].trim() : '',
           dateEnd:   endEl   ? endEl[1].trim()   : '',
         });
@@ -900,6 +944,55 @@ app.get('/api/debug/:trainNumber', async (req, res) => {
     firstStation: train.stations[0],
     lastStation: train.stations[train.stations.length-1],
     infofer: infoferResult,
+  });
+});
+
+// GET /api/debug-route?from=Bucuresti+Nord&to=Constanta&date=26.02.2026
+// Shows all trains found for a route with their raw schedule data
+app.get('/api/debug-route', async (req, res) => {
+  if (!dataReady) return res.status(503).json({ error: 'loading' });
+  const from = (req.query.from || '').trim();
+  const to   = (req.query.to   || '').trim();
+  const date = (req.query.date || todayStr()).trim();
+  if (!from || !to) return res.json({ error: 'from= and to= required' });
+
+  const fN = resolveStation(from);
+  const tN = resolveStation(to);
+  const fromSet = stationIndex.get(fN) || new Set();
+  const toSet   = stationIndex.get(tN) || new Set();
+
+  const results = [];
+  for (const tNum of fromSet) {
+    if (!toSet.has(tNum)) continue;
+    const train = trains.get(tNum);
+    if (!train) continue;
+
+    const fi = train.stations.findIndex(s => norm(s.name) === fN);
+    const ti = train.stations.findIndex(s => norm(s.name) === tN);
+    if (fi < 0 || ti < 0 || fi >= ti) continue;
+
+    const dep = train.stations[fi].dep || train.stations[fi].arr;
+    const runsToday = trainRunsOnDate(train, date);
+
+    results.push({
+      number: train.number,
+      category: train.category,
+      operator: train.operator,
+      dep,
+      scheduleEntries: train.schedule ? train.schedule.length : 0,
+      schedule: train.schedule,
+      runsToday,
+    });
+  }
+
+  results.sort((a, b) => (a.dep || '').localeCompare(b.dep || ''));
+
+  res.json({
+    from: fN, to: tN, date,
+    totalInXml: results.length,
+    runningToday: results.filter(r => r.runsToday).length,
+    notRunningToday: results.filter(r => !r.runsToday).length,
+    trains: results,
   });
 });
 
