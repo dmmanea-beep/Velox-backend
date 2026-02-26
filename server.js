@@ -16,12 +16,12 @@ const path = require('path');
 const fs   = require('fs');
 
 const XML_SOURCES = [
-  { operator: 'CFR Călători',          file: 'cfr.xml' },
+  { operator: 'CFR Călători',           file: 'cfr.xml' },
   { operator: 'Interregional Călători', file: 'interregional.xml' },
   { operator: 'Regio Călători',         file: 'regio.xml' },
   { operator: 'Transferoviar Călători', file: 'transferoviar.xml' },
   { operator: 'Astra Trans Carpatic',   file: 'astra.xml' },
-  // Softrans excluded: their XML contains wrong train numbers
+  { operator: 'Softrans',               file: 'softrans.xml' },
 ];
 
 // Remote URLs kept for manual refresh via /api/refresh-xml (admin use)
@@ -31,6 +31,7 @@ const XML_URLS = {
   'regio.xml':         'https://data.gov.ro/dataset/1da1018d-df38-4b5f-9667-88e4521abfb3/resource/771c1e7f-e552-46aa-8a6b-b9276b9b556c/download/trenuri-2025-2026_regio-calatori.xml',
   'transferoviar.xml': 'https://data.gov.ro/dataset/9d4adc7b-d407-46c2-9003-5aa87cd16fb7/resource/2f1d9f58-1e97-4a4a-bc65-86c52b7db1a9/download/trenuri-2025-2026_transferoviar-calatori.xml',
   'astra.xml':         'https://data.gov.ro/dataset/1d057a43-3eaa-4fed-a349-4106f3ad0e49/resource/aab96a77-0fbe-4770-8408-e7b23c90480d/download/trenuri-2025-2026_astratranscarpatic.xml',
+  'softrans.xml':      'https://data.gov.ro/dataset/mers-tren-softrans-s-r-l/resource/download/trenuri-2025-2026_softrans.xml',
 };
 
 const DATA_DIR = path.join(__dirname, 'data');
@@ -350,26 +351,89 @@ function norm(name) {
     .trim();
 }
 
-// Resolve a user-typed station name to the exact norm key used in stationIndex.
-// Handles cases like "București Nord" matching "Bucuresti Nord Gr.A"
+// Ghost train blocklist: trains present in XML but confirmed NOT running by InfoFer.
+// Interregional 165xx series: planned trains not yet in service as of Feb 2026.
+// 16023: CFR train present in XML but absent from InfoFer route results.
+// Remove entries here once InfoFer starts showing them.
+const GHOST_TRAIN_BLOCKLIST = new Set([
+  '16560','16561','16562','16563','16564','16565','16566','16567',
+  '16568','16569','16570','16571','16572','16573','16574','16575',
+  '16576','16577','16578','16579',
+  '16023',
+]);
+
+// Station aliases: maps user-friendly names to ALL station index keys that should match.
+// Fixes missing trains caused by XML using "Bucuresti Nord Gr. A" vs user typing "Bucuresti Nord",
+// and trains that terminate at Basarab/Obor instead of Nord.
+const STATION_ALIASES = {
+  'bucuresti nord':     ['bucuresti nord gr a', 'bucuresti nord', 'bucuresti basarab'],
+  'bucuresti':          ['bucuresti nord gr a', 'bucuresti nord', 'bucuresti basarab', 'bucuresti obor', 'bucuresti titan sud'],
+  'brasov':             ['brasov', 'brasov gr a'],
+  'cluj':               ['cluj napoca', 'cluj napoca gr a'],
+  'cluj napoca':        ['cluj napoca', 'cluj napoca gr a'],
+  'timisoara':          ['timisoara nord', 'timisoara nord gr a'],
+  'ploiesti':           ['ploiesti sud', 'ploiesti vest', 'ploiesti gr a'],
+  'constanta':          ['constanta', 'constanta gr a'],
+  'iasi':               ['iasi', 'iasi gr a'],
+  'craiova':            ['craiova', 'craiova gr a'],
+  'oradea':             ['oradea', 'oradea gr a'],
+  'arad':               ['arad', 'arad gr a'],
+  'galati':             ['galati', 'galati gr a'],
+  'bacau':              ['bacau', 'bacau gr a'],
+  'suceava':            ['suceava', 'suceava nord gr a', 'suceava nord'],
+  'deva':               ['deva', 'deva gr a'],
+  'sibiu':              ['sibiu', 'sibiu gr a'],
+  'satu mare':          ['satu mare', 'satu mare gr a'],
+  'baia mare':          ['baia mare', 'baia mare gr a'],
+  'pitesti':            ['pitesti', 'pitesti gr a'],
+};
+
+// Resolve a user-typed station name to ONE exact norm key used in stationIndex.
 function resolveStation(userInput) {
   const n = norm(userInput);
-  // 1. Exact match
   if (stationIndex.has(n)) return n;
-  // 2. Find any indexed station whose norm starts with the user input
-  //    e.g. "bucuresti nord" matches "bucuresti nord gr a"
+  // Check aliases first — pick the alias key that exists in stationIndex
+  const aliasKeys = STATION_ALIASES[n] || [];
+  for (const alias of aliasKeys) {
+    if (stationIndex.has(alias)) return alias;
+  }
+  // startsWith match: "bucuresti nord" → "bucuresti nord gr a"
   for (const key of stationIndex.keys()) {
     if (key.startsWith(n + ' ') || key === n) return key;
   }
-  // 3. Find any indexed station that contains the user input
+  // contains match
   for (const key of stationIndex.keys()) {
     if (key.includes(n)) return key;
   }
-  // 4. User input contains the indexed key (e.g. user typed full name, XML is shorter)
+  // user input contains key
   for (const key of stationIndex.keys()) {
     if (n.startsWith(key + ' ') || n === key) return key;
   }
-  return n; // fallback — return as-is
+  return n;
+}
+
+// Resolve a station name to ALL matching keys in stationIndex (for destination matching).
+// This ensures trains terminating at "Bucuresti Basarab" also appear for "Bucuresti Nord" searches.
+function resolveStationAll(userInput) {
+  const n = norm(userInput);
+  const keys = new Set();
+
+  // Start with the primary resolved key
+  keys.add(resolveStation(userInput));
+
+  // Add all aliases that exist in stationIndex
+  const aliasKeys = STATION_ALIASES[n] || [];
+  for (const alias of aliasKeys) {
+    if (stationIndex.has(alias)) keys.add(alias);
+  }
+
+  // Also add any stationIndex key that starts with the user input
+  // e.g. "bucuresti" catches all Bucuresti stations
+  for (const key of stationIndex.keys()) {
+    if (key.startsWith(n + ' ') || key === n) keys.add(key);
+  }
+
+  return [...keys].filter(k => stationIndex.has(k));
 }
 
 function guessType(cat) {
@@ -712,6 +776,8 @@ function findDirectJourneys(fromNorm, toNorm, dateStr) {
     // ── Day-of-operation check ───────────────────────────────────────────
     // Skip trains that don't run on the searched date
     if (dateStr && !trainRunsOnDate(train, dateStr)) continue;
+    // Skip confirmed ghost trains (in XML but not actually running)
+    if (GHOST_TRAIN_BLOCKLIST.has(train.number)) continue;
 
     // Find the indices of from/to in this train's station list
     const fi = train.stations.findIndex(s => norm(s.name) === fromNorm);
@@ -751,38 +817,53 @@ function findDirectJourneys(fromNorm, toNorm, dateStr) {
 }
 
 function searchJourneys(fromName, toName, dateStr) {
-  const fN = resolveStation(fromName);
-  const tN = resolveStation(toName);
+  // Use resolveStationAll to catch trains terminating at station variants
+  // e.g. "Bucuresti Nord" also catches trains at "Bucuresti Basarab"
+  const fromKeys = resolveStationAll(fromName);
+  const toKeys   = resolveStationAll(toName);
+  const fN = fromKeys[0] || resolveStation(fromName);
+  const tN = toKeys[0]   || resolveStation(toName);
 
   const journeys = [];
+  const seenTrains = new Set(); // deduplicate same train found via multiple station keys
 
-  // Direct (filtered by date)
-  const directs = findDirectJourneys(fN, tN, dateStr);
-  for (const d of directs) {
-    journeys.push({
-      dep: d.dep, arr: d.arr,
-      duration: durStr(d.durM),
-      durationMins: d.durM,
-      changes: 0,
-      trains: [d.label],
-      legs: [{
-        train:    d.label,
-        number:   d.number,
-        type:     d.type,
-        operator: d.operator,
-        from:     d.from,
-        to:       d.to,
-        dep:      d.dep,
-        arr:      d.arr,
-        stops:    d.stops,
-      }],
-    });
+  // Direct — search across ALL from/to key combinations to catch station variants
+  for (const fKey of fromKeys) {
+    for (const tKey of toKeys) {
+      const directs = findDirectJourneys(fKey, tKey, dateStr);
+      for (const d of directs) {
+        if (seenTrains.has(d.number)) continue; // deduplicate
+        seenTrains.add(d.number);
+        journeys.push({
+          dep: d.dep, arr: d.arr,
+          duration: durStr(d.durM),
+          durationMins: d.durM,
+          changes: 0,
+          trains: [d.label],
+          legs: [{
+            train:    d.label,
+            number:   d.number,
+            type:     d.type,
+            operator: d.operator,
+            from:     d.from,
+            to:       d.to,
+            dep:      d.dep,
+            arr:      d.arr,
+            stops:    d.stops,
+          }],
+        });
+      }
+    }
   }
 
-  // 1 change — always search for connections, not just when few directs found
+  // 1 change — use primary keys for connection search (performance)
   {
     const fromTrains = stationIndex.get(fN) || new Set();
-    const toTrains   = stationIndex.get(tN)  || new Set();
+    // Merge all toKey sets for connection detection
+    const toTrains = new Set();
+    for (const tKey of toKeys) {
+      for (const t of (stationIndex.get(tKey) || [])) toTrains.add(t);
+    }
 
     // Find candidate via stations: reachable from 'from' AND can reach 'to'
     const candidates = new Set();
@@ -791,10 +872,8 @@ function searchJourneys(fromName, toName, dateStr) {
       if (!train) continue;
       const fi = train.stations.findIndex(s => norm(s.name) === fN);
       if (fi < 0) continue;
-      // All stations after 'from' on this train
       train.stations.slice(fi + 1).forEach(s => {
         const n2 = norm(s.name);
-        // Check if any train from this station goes to 'to'
         const stTrains = stationIndex.get(n2) || new Set();
         for (const t2 of stTrains) {
           if (toTrains.has(t2)) { candidates.add(n2); break; }
@@ -1147,7 +1226,8 @@ app.get('/api/debug-route', async (req, res) => {
     if (fi < 0 || ti < 0 || fi >= ti) continue;
 
     const dep = train.stations[fi].dep || train.stations[fi].arr;
-    const runsToday = trainRunsOnDate(train, date);
+    const runsToday = trainRunsOnDate(train, date) && !GHOST_TRAIN_BLOCKLIST.has(train.number);
+    const isGhost = GHOST_TRAIN_BLOCKLIST.has(train.number);
 
     results.push({
       number: train.number,
@@ -1157,6 +1237,7 @@ app.get('/api/debug-route', async (req, res) => {
       scheduleEntries: train.schedule ? train.schedule.length : 0,
       schedule: train.schedule,
       runsToday,
+      isGhost: isGhost || undefined,
     });
   }
 
@@ -1275,7 +1356,7 @@ app.get('/api/xmltest', async (req, res) => {
       number: n, 
       scheduleEntries: t.schedule ? t.schedule.length : 0,
       schedule: t.schedule,
-      runsToday: trainRunsOnDate(t, todayStr()),
+      runsToday: trainRunsOnDate(t, todayStr()) && !GHOST_TRAIN_BLOCKLIST.has(t.number),
     };
   });
   results.totalTrains = trains.size;
@@ -1484,32 +1565,35 @@ async function isIrisReachable() {
 async function validateTrains(trainNumbers, dateStr) {
   if (!trainNumbers.length) return {};
   const results = {};
-  const needsIris = [];
+  const needsInfofer = [];
 
   for (const num of trainNumbers) {
     const train = trains.get(num);
     if (!train) { results[num] = false; continue; }
-    // XML schedule check — blocks trains outside date range or wrong day of week
+
+    // XML CalendarTren schedule check (instant, no network)
     if (train.schedule && train.schedule.length > 0 && !trainRunsOnDate(train, dateStr)) {
       results[num] = false;
       continue;
     }
-    needsIris.push(num);
+
+    // Trains that need online validation:
+    // - All trains pass schedule check → validate via mersultrenurilor.infofer.ro
+    // We batch these to avoid hammering InfoFer
+    needsInfofer.push(num);
   }
 
-  // Only call IRIS if it's known to be reachable (avoids 6s timeouts × 50 trains)
-  const irisOk = await isIrisReachable();
-  if (irisOk) {
-    for (let i = 0; i < needsIris.length; i += 10) {
-      const batch = needsIris.slice(i, i + 10);
-      await Promise.all(batch.map(async num => {
-        results[num] = await checkTrainOnInfoFer(num, dateStr);
-      }));
-    }
-  } else {
-    // IRIS unreachable — fail open for all remaining trains
-    for (const num of needsIris) results[num] = true;
-  }
+  // Validate via mersultrenurilor.infofer.ro (confirmed reachable from Render)
+  // Limit to 15 trains max to avoid slow responses; fail-open for the rest
+  const toValidate = needsInfofer.slice(0, 15);
+  const failOpen   = needsInfofer.slice(15);
+
+  await Promise.all(toValidate.map(async num => {
+    results[num] = await checkTrainOnInfoFer(num, dateStr);
+  }));
+
+  // Fail open for trains beyond the validation limit
+  for (const num of failOpen) results[num] = true;
 
   return results;
 }
