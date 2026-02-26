@@ -55,14 +55,15 @@ const cacheGet = (k) => { const i = _cache[k]; return (i && Date.now() < i.e) ? 
 const cacheSet = (k, v, s) => { _cache[k] = { v, e: Date.now() + s * 1000 }; };
 
 // ─── HTTP HELPER ───────────────────────────────────────────────────────────
-function get(url, timeout = 60000, hops = 0) {
+function get(url, timeout = 60000, hops = 0, extraHeaders = {}) {
   return new Promise((res, rej) => {
     if (hops > 5) return rej(new Error('Too many redirects'));
     const lib = url.startsWith('https') ? https : http;
     const req = lib.get(url, {
       headers: {
-        'User-Agent': 'VeloxApp/4.0',
+        'User-Agent': 'VeloxApp/5.0',
         'Accept': '*/*',
+        ...extraHeaders,
       }
     }, (r) => {
       if (r.statusCode >= 300 && r.statusCode < 400 && r.headers.location) {
@@ -909,21 +910,26 @@ async function getLiveDelay(trainNumber) {
 }
 
 // ─── ROUTES ────────────────────────────────────────────────────────────────
+// Architecture: single Express server with namespaced route groups.
+// Each group is self-contained — can later be split into a microservice
+// or proxied via API gateway (Kong / AWS API GW / Nginx) with zero refactoring.
+//
+// Route namespaces:
+//   /api/trains/*   – Romanian domestic trains (ACTIVE)
+//   /api/flights/*  – Flights search + pricing  (STUB — needs SKYSCANNER_API_KEY)
+//   /api/intl/*     – Intl trains + buses        (STUB — needs TRAINLINE_API_KEY / FLIXBUS_API_KEY)
+//   /api/cars/*     – Car rental offers          (STUB — needs RENTALCARS_AFFILIATE_ID)
 
 app.get('/', (req, res) => res.json({
-  name:     'Velox API',
-  version:  '4.0.0',
-  status:   loadStatus,
-  trains:   trains.size,
-  stations: stationIndex.size,
-  ready:    dataReady,
-  endpoints: {
-    health:       'GET /health',
-    stations:     'GET /api/stations?q=Brasov',
-    itineraries:  'GET /api/itineraries?from=Brașov&to=Constanța&date=24.02.2026',
-    trainRoute:   'GET /api/train/:number',
-    trainLive:    'GET /api/train/:number/live',
-    stationBoard: 'GET /api/board/:stationName',
+  name:    'Velox API',
+  version: '5.0.0',
+  status:  loadStatus,
+  ready:   dataReady,
+  modules: {
+    trains:  { status: 'active', endpoints: ['/api/stations', '/api/itineraries', '/api/train/:num', '/api/train/:num/live', '/api/board/:station'] },
+    flights: { status: 'stub',   endpoints: ['/api/flights/search'], activate: 'set SKYSCANNER_API_KEY env var' },
+    intl:    { status: 'stub',   endpoints: ['/api/intl/trains', '/api/intl/buses'], activate: 'set TRAINLINE_API_KEY and/or FLIXBUS_API_KEY env var' },
+    cars:    { status: 'stub',   endpoints: ['/api/cars/search'], activate: 'set RENTALCARS_AFFILIATE_ID env var' },
   },
 }));
 
@@ -933,7 +939,136 @@ app.get('/health', (req, res) => res.json({
   trains:   trains.size,
   stations: stationIndex.size,
   time:     new Date().toISOString(),
+  integrations: {
+    flights: !!process.env.SKYSCANNER_API_KEY,
+    intlTrains: !!process.env.TRAINLINE_API_KEY,
+    buses:   !!process.env.FLIXBUS_API_KEY,
+    cars:    !!process.env.RENTALCARS_AFFILIATE_ID,
+  },
 }));
+
+// ─── FLIGHTS (Skyscanner via RapidAPI) ─────────────────────────────────────
+// Activate: add SKYSCANNER_API_KEY to Render environment variables
+// Sign up:  https://rapidapi.com/skyscanner/api/skyscanner50
+//
+// GET /api/flights/search?from=OTP&to=LHR&date=26.02.2026&adults=1
+app.get('/api/flights/search', async (req, res) => {
+  if (!process.env.SKYSCANNER_API_KEY) {
+    return res.status(503).json({
+      error: 'Flight search not yet configured',
+      activate: 'Add SKYSCANNER_API_KEY to your Render environment variables',
+      signup: 'https://rapidapi.com/skyscanner/api/skyscanner50',
+    });
+  }
+  const { from, to, date, adults = 1 } = req.query;
+  if (!from || !to || !date) return res.status(400).json({ error: 'from, to, date required' });
+
+  const cacheKey = `flights:${from}:${to}:${date}:${adults}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return res.json(cached);
+
+  try {
+    // Skyscanner Live Prices v1 via RapidAPI
+    const [d, m, y] = date.split('.');
+    const isoDate = `${y}-${m}-${d}`;
+    const url = `https://skyscanner50.p.rapidapi.com/api/v1/searchFlights?origin=${encodeURIComponent(from)}&destination=${encodeURIComponent(to)}&date=${isoDate}&adults=${adults}&currency=RON&locale=ro-RO&market=RO`;
+    const resp = await get(url, 15000, 0, {
+      'X-RapidAPI-Key': process.env.SKYSCANNER_API_KEY,
+      'X-RapidAPI-Host': 'skyscanner50.p.rapidapi.com',
+    });
+    if (resp.status !== 200) throw new Error(`Skyscanner API returned ${resp.status}`);
+    const data = JSON.parse(resp.body);
+
+    // Normalise into Velox result shape
+    const flights = (data?.data?.itineraries || []).map(it => ({
+      id:        it.id,
+      dep:       it.legs?.[0]?.departure,
+      arr:       it.legs?.[0]?.arrival,
+      duration:  it.legs?.[0]?.durationInMinutes,
+      stops:     it.legs?.[0]?.stopCount,
+      carrier:   it.legs?.[0]?.carriers?.marketing?.[0]?.name,
+      price:     it.price?.raw,
+      currency:  'RON',
+      deeplink:  it.deeplink,
+    }));
+
+    const result = { from, to, date, adults: parseInt(adults), flights };
+    cacheSet(cacheKey, result, 300); // cache 5 min
+    res.json(result);
+  } catch (e) {
+    res.status(502).json({ error: 'Flight search failed', detail: e.message });
+  }
+});
+
+// ─── INTERNATIONAL TRAINS (Trainline EU) ───────────────────────────────────
+// Activate: add TRAINLINE_API_KEY to Render environment variables
+// Sign up:  https://www.thetrainline.com/en/affiliate-programme
+//
+// GET /api/intl/trains?from=Bucuresti+Nord&to=Budapest-Keleti&date=26.02.2026
+app.get('/api/intl/trains', async (req, res) => {
+  if (!process.env.TRAINLINE_API_KEY) {
+    return res.status(503).json({
+      error: 'International train search not yet configured',
+      activate: 'Add TRAINLINE_API_KEY to your Render environment variables',
+      signup: 'https://www.thetrainline.com/en/affiliate-programme',
+    });
+  }
+  // TODO: implement Trainline EU search when API key is available
+  res.status(501).json({ error: 'Not yet implemented' });
+});
+
+// ─── BUSES (FlixBus) ───────────────────────────────────────────────────────
+// Activate: add FLIXBUS_API_KEY to Render environment variables
+// Sign up:  https://www.flixbus.com/bus-routes/affiliate-programme
+//
+// GET /api/intl/buses?from=Bucuresti&to=Vienna&date=26.02.2026
+app.get('/api/intl/buses', async (req, res) => {
+  if (!process.env.FLIXBUS_API_KEY) {
+    return res.status(503).json({
+      error: 'Bus search not yet configured',
+      activate: 'Add FLIXBUS_API_KEY to your Render environment variables',
+      signup: 'https://www.flixbus.com/bus-routes/affiliate-programme',
+    });
+  }
+  // TODO: implement FlixBus search when API key is available
+  res.status(501).json({ error: 'Not yet implemented' });
+});
+
+// ─── CAR RENTAL (RentalCars affiliate) ─────────────────────────────────────
+// Activate: add RENTALCARS_AFFILIATE_ID to Render environment variables
+// Sign up:  https://partners.rentalcars.com/
+// Commission: typically 6–8% per completed booking
+//
+// GET /api/cars/search?pickup=OTP&dropoff=OTP&from=26.02.2026&to=02.03.2026
+app.get('/api/cars/search', async (req, res) => {
+  if (!process.env.RENTALCARS_AFFILIATE_ID) {
+    return res.status(503).json({
+      error: 'Car rental not yet configured',
+      activate: 'Add RENTALCARS_AFFILIATE_ID to your Render environment variables',
+      signup: 'https://partners.rentalcars.com/',
+    });
+  }
+  const { pickup, dropoff, from, to, currency = 'RON' } = req.query;
+  if (!pickup || !from || !to) return res.status(400).json({ error: 'pickup, from, to required' });
+
+  // RentalCars deeplink — sends user to booking page with commission tracking
+  const affiliateId = process.env.RENTALCARS_AFFILIATE_ID;
+  const [fd, fm, fy] = from.split('.');
+  const [td, tm, ty] = to.split('.');
+  const pickupDate  = `${fy}-${fm}-${fd}`;
+  const dropoffDate = `${ty}-${tm}-${td}`;
+  const deeplink = `https://www.rentalcars.com/SearchResults.do?affiliateCode=${affiliateId}&preflang=ro&currency=${currency}&pickUpIata=${encodeURIComponent(pickup)}&dropOffIata=${encodeURIComponent(dropoff||pickup)}&puDay=${fd}&puMonth=${fm}&puYear=${fy}&doDay=${td}&doMonth=${tm}&doYear=${ty}`;
+
+  res.json({
+    pickup, dropoff: dropoff || pickup,
+    pickupDate, dropoffDate,
+    currency,
+    bookingUrl: deeplink,
+    note: 'Redirects to RentalCars with affiliate tracking. Commission paid per completed booking.',
+  });
+});
+
+// ─── TRAIN ROUTES (active) ─────────────────────────────────────────────────
 
 
 // GET /api/debug/:trainNumber — show raw schedule data + InfoFer test
@@ -1107,7 +1242,6 @@ app.get('/api/xmltest', async (req, res) => {
     while ((m = re.exec(xml)) !== null && total < 100) {
       total++;
       if (/CalendarTren/.test(m[1]) || /ZileSaptamana/.test(m[1])) withSched++;
-    }
     }
     results.xml.trainsChecked = total;
     results.xml.withSchedule = withSched;
